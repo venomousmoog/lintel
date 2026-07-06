@@ -48,6 +48,5 @@ codesign --force --sign "$SIGN_ID" "$APP"
 echo "Built $APP  (signed with identity: '$SIGN_ID')"
 codesign -dvv "$APP" 2>&1 | grep -E 'Identifier|Authority|Signature' || true
 echo
-echo "Run the bundle:            open $APP        (watch mode; LSUIElement = no Dock icon)"
-echo "Or the inner binary:       $APP/Contents/MacOS/lintel read"
-echo "First run needs Accessibility: System Settings ▸ Privacy & Security ▸ Accessibility ▸ add Lintel."
+echo "Run in the background:     open $APP        (floating menu bar; no Dock icon; quit via the menu-bar icon)"
+echo "First run needs Accessibility: System Settings > Privacy & Security > Accessibility > enable Lintel."

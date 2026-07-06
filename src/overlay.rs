@@ -13,10 +13,11 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSFont, NSLayoutAttribute, NSPanel, NSScreen,
-    NSStackView, NSStatusBar, NSUserInterfaceLayoutOrientation, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSButton, NSColor, NSFont, NSImage, NSLayoutAttribute, NSMenu, NSPanel,
+    NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSUserInterfaceLayoutOrientation,
+    NSVariableStatusItemLength, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
@@ -55,6 +56,7 @@ struct Inner {
     current_pid: i32,
     bar_size: CGSize,
     open_top: Option<usize>,
+    status_item: Option<Retained<NSStatusItem>>,
 }
 
 pub struct Ivars {
@@ -89,6 +91,11 @@ define_class!(
                 self.on_item_clicked(b.tag() as usize);
             }
         }
+
+        #[unsafe(method(quitLintel:))]
+        fn quit_(&self, _sender: Option<&AnyObject>) {
+            std::process::exit(0);
+        }
     }
 );
 
@@ -103,6 +110,7 @@ impl Controller {
             current_pid: 0,
             bar_size: CGSize::new(0.0, BAR_H),
             open_top: None,
+            status_item: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -110,8 +118,9 @@ impl Controller {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Start the ~10 Hz reconciliation timer.
+    /// Install the menu-bar status item and start the ~10 Hz reconciliation timer.
     pub fn start(&self) {
+        self.setup_status_item();
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.1,
@@ -121,6 +130,38 @@ impl Controller {
                 true,
             );
         }
+    }
+
+    /// A menu-bar status item (icon + "Quit Lintel"), so Lintel can run in the background
+    /// without a controlling terminal.
+    fn setup_status_item(&self) {
+        let mtm = self.mtm();
+        let status_bar = NSStatusBar::systemStatusBar();
+        let item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+        if let Some(button) = item.button(mtm) {
+            let sym = NSString::from_str("menubar.rectangle");
+            let desc = NSString::from_str("Lintel");
+            if let Some(img) =
+                NSImage::imageWithSystemSymbolName_accessibilityDescription(&sym, Some(&desc))
+            {
+                img.setTemplate(true);
+                button.setImage(Some(&img));
+            } else {
+                button.setTitle(&NSString::from_str("L")); // fallback if the symbol is unavailable
+            }
+        }
+        let menu = NSMenu::new(mtm);
+        let target: &AnyObject = self;
+        unsafe {
+            let quit = menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str("Quit Lintel"),
+                Some(sel!(quitLintel:)),
+                &NSString::from_str("q"),
+            );
+            quit.setTarget(Some(target));
+        }
+        item.setMenu(Some(&menu));
+        self.ivars().inner.borrow_mut().status_item = Some(item);
     }
 
     fn on_tick(&self) {

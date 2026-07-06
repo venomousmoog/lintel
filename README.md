@@ -43,19 +43,29 @@ has a public fallback). Two areas need early prototype spikes: behind-window blu
 
 ## Building & running
 
-```sh
-cargo build
-cargo run -- run                      # THE MVP: floating menu bar above the focused window
-cargo run -- read                     # (debug) print the frontmost app's menu bar
-cargo run -- press "File" "New"       # (debug) fire a first-level item in the frontmost app
-cargo run -- watch                    # (debug) log focus/move/resize AX events
+Run in the **background** (recommended — no terminal, no Dock icon; quit from its menu-bar icon):
 
-LINTEL_DEBUG=1 cargo run -- run       # run with placement debug logging on stderr
-scripts/bundle.sh                     # build a signed Lintel.app (see the script for TCC/signing notes)
+```sh
+scripts/bundle.sh                 # builds & signs Lintel.app
+open target/Lintel.app            # launches detached; a menu-bar icon appears (▸ Quit Lintel)
 ```
 
-With `run`, focus a normal (non-maximized) window and its menus appear in a bar just above it;
-click a menu to drop down its items and click one to trigger it. Ctrl-C to quit.
+First launch prompts for Accessibility (System Settings ▸ Privacy & Security ▸ Accessibility ▸
+enable Lintel); the bar appears automatically once granted. For the grant to survive rebuilds,
+sign with a stable identity — see `scripts/bundle.sh`.
+
+Foreground / dev:
+
+```sh
+cargo run                         # THE MVP in the foreground (Ctrl-C to quit)
+LINTEL_DEBUG=1 cargo run          # + placement debug logging on stderr
+cargo run -- read                 # (debug) print the frontmost app's menu bar
+cargo run -- press "File" "New"   # (debug) fire a first-level item in the frontmost app
+cargo run -- watch                # (debug) log focus/move/resize AX events
+```
+
+Focus a normal (non-maximized) window and its menus appear in a bar just above it; click a menu
+to drop down its items and click one to trigger it.
 
 First use needs Accessibility permission: **System Settings ▸ Privacy & Security ▸ Accessibility**
 (the binary prompts if untrusted). For the grant to survive rebuilds, sign with a stable identity —

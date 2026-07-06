@@ -130,13 +130,19 @@ fn cmd_press(top: &str, item: &str) {
 }
 
 fn cmd_run() {
-    if !ensure_trust() {
-        std::process::exit(1);
-    }
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
+    // Don't exit if untrusted — keep running (status item stays up) and start working once
+    // Accessibility is granted (the tick loop re-checks each frame).
+    if !is_trusted() {
+        let _ = prompt_trust();
+        eprintln!(
+            "Grant Accessibility in System Settings > Privacy & Security > Accessibility; \
+             the menu bar appears automatically once granted."
+        );
+    }
     let controller = overlay::Controller::new(mtm);
     controller.start();
-    println!("Lintel running. Focus a window to see its local menu bar. Ctrl-C to quit.");
+    println!("Lintel running (menu-bar icon > Quit Lintel to stop).");
 
     let ns = NSApplication::sharedApplication(mtm);
     ns.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -174,7 +180,8 @@ fn main() {
             (Some(top), Some(item)) => cmd_press(top, item),
             _ => eprintln!("usage: lintel press \"<TopMenu>\" \"<Item>\""),
         },
-        Some("read") | None => cmd_read(),
-        Some(other) => eprintln!("unknown command '{other}' (try: read | press | watch)"),
+        Some("read") => cmd_read(),
+        None => cmd_run(), // default (incl. when launched as a .app bundle)
+        Some(other) => eprintln!("unknown command '{other}' (try: run | read | press | watch)"),
     }
 }

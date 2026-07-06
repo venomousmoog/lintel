@@ -17,7 +17,8 @@ features = [
     "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView", "NSControl",
     "NSButton", "NSButtonCell", "NSStackView", "NSVisualEffectView", "NSScreen",
     "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSLayoutConstraint",
-    "NSFont", "NSStatusBar", "NSWorkspace", "NSRunningApplication",
+    "NSFont", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSImage",
+    "NSWorkspace", "NSRunningApplication", "objc2-core-foundation",
 ]
 
 [dependencies.objc2-core-foundation]
