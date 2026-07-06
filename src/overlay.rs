@@ -8,16 +8,18 @@
 //!   * presses the cached leaf element (no re-resolve-by-path yet — fine for static/native menus)
 
 use std::cell::RefCell;
+use core::ptr::NonNull;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSFont, NSImage, NSLayoutAttribute, NSMenu, NSPanel,
-    NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSUserInterfaceLayoutOrientation,
-    NSVariableStatusItemLength, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
-    NSWorkspace,
+    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSImage, NSLayoutAttribute,
+    NSMenu, NSPanel, NSScreen, NSStackView, NSStatusBar, NSStatusItem,
+    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
@@ -43,6 +45,7 @@ struct ItemEntry {
     title: String,
     el: CFRetained<AXUIElement>,
     is_sep: bool,
+    enabled: bool,
 }
 struct TopMenu {
     title: String,
@@ -57,6 +60,7 @@ struct Inner {
     bar_size: CGSize,
     open_top: Option<usize>,
     status_item: Option<Retained<NSStatusItem>>,
+    monitor: Option<Retained<AnyObject>>,
 }
 
 pub struct Ivars {
@@ -81,7 +85,7 @@ define_class!(
         #[unsafe(method(topClicked:))]
         fn top_clicked_(&self, sender: Option<&AnyObject>) {
             if let Some(b) = sender.and_then(|s| s.downcast_ref::<NSButton>()) {
-                self.on_top_clicked(b.tag() as usize);
+                self.on_top_clicked(b);
             }
         }
 
@@ -111,6 +115,7 @@ impl Controller {
             bar_size: CGSize::new(0.0, BAR_H),
             open_top: None,
             status_item: None,
+            monitor: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -118,9 +123,10 @@ impl Controller {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Install the menu-bar status item and start the ~10 Hz reconciliation timer.
+    /// Install the menu-bar status item, the click-away monitor, and the ~10 Hz timer.
     pub fn start(&self) {
         self.setup_status_item();
+        self.setup_click_away();
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.1,
@@ -162,6 +168,28 @@ impl Controller {
         }
         item.setMenu(Some(&menu));
         self.ivars().inner.borrow_mut().status_item = Some(item);
+    }
+
+    /// A global mouse-down monitor that dismisses the dropdown when the user clicks anywhere
+    /// outside Lintel's own windows (clicks on our bar/dropdown are local, so they don't fire it).
+    fn setup_click_away(&self) {
+        let this = self.retain();
+        let handler = RcBlock::new(move |_ev: NonNull<NSEvent>| {
+            this.close_dropdown();
+        });
+        let mask = NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown;
+        let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &handler);
+        self.ivars().inner.borrow_mut().monitor = token;
+    }
+
+    fn close_dropdown(&self) {
+        if std::env::var_os("LINTEL_DEBUG").is_some() {
+            eprintln!("[dbg] close_dropdown");
+        }
+        let inner = self.ivars().inner.borrow();
+        inner.dropdown.orderOut(None);
+        drop(inner);
+        self.ivars().inner.borrow_mut().open_top = None;
     }
 
     fn on_tick(&self) {
@@ -236,8 +264,11 @@ impl Controller {
                             .into_iter()
                             .map(|mi| {
                                 let t = ax::attr_string(&mi, names::AX_TITLE).unwrap_or_default();
+                                let enabled =
+                                    ax::attr_bool(&mi, names::AX_ENABLED).unwrap_or(true);
                                 ItemEntry {
                                     is_sep: t.is_empty(),
+                                    enabled,
                                     title: t,
                                     el: mi,
                                 }
@@ -263,7 +294,7 @@ impl Controller {
         for (i, top) in model.iter().enumerate() {
             // The app menu (first item, after the Apple menu is dropped) is bold, like macOS.
             let f: &NSFont = if i == 0 { &bold } else { &font };
-            let btn = make_button(mtm, &top.title, f, target, sel!(topClicked:), i as isize);
+            let btn = make_button(mtm, &top.title, f, true, target, sel!(topClicked:), i as isize);
             stack.addArrangedSubview(&btn);
         }
         // Width fits the titles; height is the system menu bar plus a little vertical margin.
@@ -282,7 +313,11 @@ impl Controller {
         inner.dropdown.orderOut(None);
     }
 
-    fn on_top_clicked(&self, idx: usize) {
+    fn on_top_clicked(&self, button: &NSButton) {
+        let idx = button.tag() as usize;
+        if std::env::var_os("LINTEL_DEBUG").is_some() {
+            eprintln!("[dbg] top_clicked idx={idx}");
+        }
         let mtm = self.mtm();
         let (effect, stack) = make_content(mtm, NSUserInterfaceLayoutOrientation::Vertical);
         let (font, _bold) = menu_bar_fonts(mtm);
@@ -296,20 +331,30 @@ impl Controller {
                 if it.is_sep {
                     continue;
                 }
-                let btn = make_button(mtm, &it.title, &font, target, sel!(itemClicked:), j as isize);
+                let btn = make_button(
+                    mtm,
+                    &it.title,
+                    &font,
+                    it.enabled,
+                    target,
+                    sel!(itemClicked:),
+                    j as isize,
+                );
                 stack.addArrangedSubview(&btn);
             }
         }
         let size = stack.fittingSize();
 
+        // The clicked title's left edge in screen coords, so the dropdown aligns under it.
+        let in_win = button.convertRect_toView(button.bounds(), None);
+
         let inner = self.ivars().inner.borrow_mut();
+        let on_screen = inner.bar.convertRectToScreen(in_win);
         inner.dropdown.setContentView(Some(&effect));
         inner.dropdown.setContentSize(size);
         stack.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
-
-        // Left-align the dropdown under the bar (MVP; not yet under the clicked item).
         let bar_frame = inner.bar.frame();
-        let origin = NSPoint::new(bar_frame.origin.x, bar_frame.origin.y - size.height);
+        let origin = NSPoint::new(on_screen.origin.x - 6.0, bar_frame.origin.y - size.height);
         inner.dropdown.setFrameOrigin(origin);
         inner.dropdown.orderFront(None);
         drop(inner);
@@ -411,10 +456,12 @@ fn make_content(
     (effect, stack)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_button(
     mtm: MainThreadMarker,
     title: &str,
     font: &NSFont,
+    enabled: bool,
     target: &AnyObject,
     action: objc2::runtime::Sel,
     tag: isize,
@@ -424,6 +471,7 @@ fn make_button(
         unsafe { NSButton::buttonWithTitle_target_action(&ns, Some(target), Some(action), mtm) };
     btn.setBordered(false);
     btn.setFont(Some(font));
+    btn.setEnabled(enabled);
     btn.setTag(tag);
     btn
 }

@@ -12,7 +12,7 @@ use objc2_application_services::{
     kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGSize, kCFBooleanTrue,
+    CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGSize, kCFBooleanTrue,
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
 
@@ -21,6 +21,7 @@ pub mod names {
     pub const AX_MENU_BAR: &str = "AXMenuBar";
     pub const AX_CHILDREN: &str = "AXChildren";
     pub const AX_TITLE: &str = "AXTitle";
+    pub const AX_ENABLED: &str = "AXEnabled";
     pub const AX_PRESS: &str = "AXPress";
     pub const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const AX_MAIN_WINDOW: &str = "AXMainWindow";
@@ -90,6 +91,12 @@ fn copy_attr(el: &AXUIElement, attr: &str) -> Option<CFRetained<CFType>> {
 pub fn attr_string(el: &AXUIElement, attr: &str) -> Option<String> {
     let v = copy_attr(el, attr)?;
     v.downcast_ref::<CFString>().map(|s| s.to_string())
+}
+
+/// Read a boolean attribute (e.g. `AXEnabled`).
+pub fn attr_bool(el: &AXUIElement, attr: &str) -> Option<bool> {
+    let v = copy_attr(el, attr)?;
+    v.downcast_ref::<CFBoolean>().map(|b| b.value())
 }
 
 /// Read an element-valued attribute (e.g. `AXMenuBar`).
