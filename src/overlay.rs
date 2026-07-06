@@ -29,8 +29,12 @@ use crate::ax::{self, names};
 const BAR_H: f64 = 24.0; // fallback; the real bar height tracks the system menu bar (§ menu_bar_height)
 const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (design v2 §6.3)
 const NS_POPUP_LEVEL: isize = 101; // Lintel's own dropdown
-const ITEM_SPACING: f64 = 16.0; // gap between top-level menu titles
-const BAR_EDGE: f64 = 10.0; // left/right padding inside the bar
+const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
+const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
+const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
+const FONT_SIZE: f64 = 15.0; // slightly larger than the default menu-bar font
+const CORNER_RADIUS: f64 = 12.0; // matches the macOS window corner radius (rounds the bar's ends)
+const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
 
 // ---- menu model (elements cached for the current app) -------------------------------------
 
@@ -163,8 +167,8 @@ impl Controller {
                 pos.x, pos.y, size.width, size.height, x, y_top, inner.bar_size.width, inner.bar_size.height
             );
         }
-        // Bar's bottom edge sits on the window's top edge (design v2 §8.2): origin.y = y_top.
-        inner.bar.setFrameOrigin(NSPoint::new(x, y_top));
+        // Bar sits WINDOW_GAP above the window's top edge (design v2 §8.2).
+        inner.bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
         inner.bar.orderFront(None);
     }
 
@@ -221,9 +225,9 @@ impl Controller {
             let btn = make_button(mtm, &top.title, f, target, sel!(topClicked:), i as isize);
             stack.addArrangedSubview(&btn);
         }
-        // Width fits the titles; height matches the system menu bar (items centered via CenterY).
+        // Width fits the titles; height is the system menu bar plus a little vertical margin.
         let fit = stack.fittingSize();
-        let size = CGSize::new(fit.width, menu_bar_height());
+        let size = CGSize::new(fit.width, menu_bar_height() + BAR_V_MARGIN);
 
         let inner_ref = self.ivars();
         let mut inner = inner_ref.inner.borrow_mut();
@@ -317,7 +321,7 @@ fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     panel.setLevel(level);
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
-    panel.setHasShadow(true);
+    panel.setHasShadow(false); // no black outline; the rounded acrylic view is the whole visual
     panel.setCollectionBehavior(
         NSWindowCollectionBehavior::MoveToActiveSpace
             | NSWindowCollectionBehavior::Stationary
@@ -335,6 +339,11 @@ fn make_content(
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     effect.setState(NSVisualEffectState::Active);
     effect.setWantsLayer(true);
+    // Round the blurred background to the macOS window corner radius (clips the blur).
+    if let Some(layer) = effect.layer() {
+        layer.setCornerRadius(CORNER_RADIUS);
+        layer.setMasksToBounds(true);
+    }
 
     let stack = NSStackView::new(mtm);
     stack.setOrientation(orient);
@@ -386,8 +395,8 @@ fn menu_bar_height() -> f64 {
 /// The system menu-bar font, in regular and bold (bold is used for the app menu, like macOS).
 fn menu_bar_fonts(mtm: MainThreadMarker) -> (Retained<NSFont>, Retained<NSFont>) {
     let _ = mtm;
-    let regular = NSFont::menuBarFontOfSize(0.0);
-    let bold = NSFont::boldSystemFontOfSize(regular.pointSize());
+    let regular = NSFont::menuBarFontOfSize(FONT_SIZE);
+    let bold = NSFont::boldSystemFontOfSize(FONT_SIZE);
     (regular, bold)
 }
 
