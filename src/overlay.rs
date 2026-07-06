@@ -32,6 +32,7 @@ use crate::ax::{self, names};
 const BAR_H: f64 = 24.0; // fallback; the real bar height tracks the system menu bar (§ menu_bar_height)
 const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (design v2 §6.3)
 const NS_POPUP_LEVEL: isize = 101; // Lintel's own dropdown
+const TICK_INTERVAL: f64 = 1.0 / 60.0; // window-follow poll rate (~60 Hz; was 10 Hz)
 const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
 const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
 const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
@@ -61,6 +62,7 @@ struct Inner {
     open_top: Option<usize>,
     status_item: Option<Retained<NSStatusItem>>,
     monitor: Option<Retained<AnyObject>>,
+    last_frame: Option<(CGPoint, CGSize)>, // last focused-window frame we positioned to
 }
 
 pub struct Ivars {
@@ -116,6 +118,7 @@ impl Controller {
             open_top: None,
             status_item: None,
             monitor: None,
+            last_frame: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -129,7 +132,7 @@ impl Controller {
         self.setup_click_away();
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                0.1,
+                TICK_INTERVAL,
                 self,
                 sel!(tick:),
                 None,
@@ -229,11 +232,16 @@ impl Controller {
         }
 
         let (x, y_top) = self.place(pos);
-        let inner = self.ivars().inner.borrow();
+        let mut inner = self.ivars().inner.borrow_mut();
+        // Only touch the panel when the window actually moved/resized (avoids 60 Hz churn).
+        if inner.last_frame == Some((pos, size)) {
+            return;
+        }
+        inner.last_frame = Some((pos, size));
         if std::env::var_os("LINTEL_DEBUG").is_some() {
             eprintln!(
-                "[dbg] pid={pid} winpos=({:.0},{:.0}) winsize=({:.0},{:.0}) baro=({:.0},{:.0}) barsz=({:.0},{:.0})",
-                pos.x, pos.y, size.width, size.height, x, y_top, inner.bar_size.width, inner.bar_size.height
+                "[dbg] pid={pid} winpos=({:.0},{:.0}) winsize=({:.0},{:.0}) baro=({:.0},{:.0})",
+                pos.x, pos.y, size.width, size.height, x, y_top
             );
         }
         // Bar sits WINDOW_GAP above the window's top edge (design v2 §8.2).
@@ -310,6 +318,7 @@ impl Controller {
         inner.model = model;
         inner.current_pid = pid;
         inner.open_top = None;
+        inner.last_frame = None; // bar size changed; reposition on the next tick
         inner.dropdown.orderOut(None);
     }
 
@@ -386,9 +395,10 @@ impl Controller {
     }
 
     fn hide_all(&self) {
-        let inner = self.ivars().inner.borrow();
+        let mut inner = self.ivars().inner.borrow_mut();
         inner.bar.orderOut(None);
         inner.dropdown.orderOut(None);
+        inner.last_frame = None; // force a reposition when we come back
     }
 }
 
