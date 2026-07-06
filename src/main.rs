@@ -13,6 +13,7 @@
 
 mod ax;
 mod observer;
+mod overlay;
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWorkspace};
@@ -128,6 +129,21 @@ fn cmd_press(top: &str, item: &str) {
     eprintln!("Item '{top} > {item}' not found.");
 }
 
+fn cmd_run() {
+    if !ensure_trust() {
+        std::process::exit(1);
+    }
+    let mtm = MainThreadMarker::new().expect("must run on the main thread");
+    let controller = overlay::Controller::new(mtm);
+    controller.start();
+    println!("Lintel running. Focus a window to see its local menu bar. Ctrl-C to quit.");
+
+    let ns = NSApplication::sharedApplication(mtm);
+    ns.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    ns.run();
+    drop(controller); // keep alive for the run loop's lifetime
+}
+
 fn cmd_watch() {
     if !ensure_trust() {
         std::process::exit(1);
@@ -152,6 +168,7 @@ fn cmd_watch() {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("run") => cmd_run(),
         Some("watch") => cmd_watch(),
         Some("press") => match (args.get(2), args.get(3)) {
             (Some(top), Some(item)) => cmd_press(top, item),

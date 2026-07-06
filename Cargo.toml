@@ -9,15 +9,20 @@ objc2 = "0.6.4"
 
 [dependencies.objc2-foundation]
 version = "0.3.2"
-features = ["NSString"]
+features = ["NSString", "NSArray", "NSTimer", "NSDate", "NSGeometry", "objc2-core-foundation"]
 
 [dependencies.objc2-app-kit]
 version = "0.3.2"
-features = ["NSApplication", "NSWorkspace", "NSRunningApplication"]
+features = [
+    "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView", "NSControl",
+    "NSButton", "NSButtonCell", "NSStackView", "NSVisualEffectView", "NSScreen",
+    "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSFont",
+    "NSWorkspace", "NSRunningApplication",
+]
 
 [dependencies.objc2-core-foundation]
 version = "0.3.2"
-features = ["CFString", "CFArray", "CFDictionary", "CFRunLoop", "CFNumber"]
+features = ["CFString", "CFArray", "CFDictionary", "CFRunLoop", "CFNumber", "CFCGTypes"]
 
 [dependencies.objc2-application-services]
 version = "0.3.2"

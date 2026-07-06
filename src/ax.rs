@@ -8,11 +8,11 @@ use core::ffi::c_void;
 use core::ptr::{self, NonNull};
 
 use objc2_application_services::{
-    AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElement,
+    AXError, AXIsProcessTrusted, AXIsProcessTrustedWithOptions, AXUIElement, AXValue, AXValueType,
     kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFDictionary, CFRetained, CFString, CFType, kCFBooleanTrue,
+    CFArray, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGSize, kCFBooleanTrue,
     kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
 
@@ -22,6 +22,10 @@ pub mod names {
     pub const AX_CHILDREN: &str = "AXChildren";
     pub const AX_TITLE: &str = "AXTitle";
     pub const AX_PRESS: &str = "AXPress";
+    pub const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
+    pub const AX_MAIN_WINDOW: &str = "AXMainWindow";
+    pub const AX_POSITION: &str = "AXPosition";
+    pub const AX_SIZE: &str = "AXSize";
     pub const AX_FOCUSED_WINDOW_CHANGED: &str = "AXFocusedWindowChanged";
     pub const AX_WINDOW_MOVED: &str = "AXWindowMoved";
     pub const AX_WINDOW_RESIZED: &str = "AXWindowResized";
@@ -119,4 +123,43 @@ pub fn children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
 /// Perform `AXPress` on a (leaf) element.
 pub fn press(el: &AXUIElement) -> AXError {
     unsafe { el.perform_action(&cfstr(names::AX_PRESS)) }
+}
+
+/// The focused (or main) window element of an app.
+pub fn focused_window(app: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
+    attr_element(app, names::AX_FOCUSED_WINDOW).or_else(|| attr_element(app, names::AX_MAIN_WINDOW))
+}
+
+/// Read an `AXValue`-boxed attribute of the given `AXValueType` into `out`. Returns false on failure.
+fn attr_axvalue(el: &AXUIElement, attr: &str, ty: AXValueType, out: NonNull<c_void>) -> bool {
+    let Some(v) = copy_attr(el, attr) else {
+        return false;
+    };
+    // The value is an AXValue box; move ownership across the type cast (like `attr_element`).
+    let axv: CFRetained<AXValue> = unsafe { CFRetained::from_raw(CFRetained::into_raw(v).cast()) };
+    unsafe { axv.value(ty, out) }
+}
+
+/// Read a `CGPoint`-valued attribute (e.g. `AXPosition`; global top-left coords).
+pub fn attr_point(el: &AXUIElement, attr: &str) -> Option<CGPoint> {
+    let mut p = CGPoint::new(0.0, 0.0);
+    let ok = attr_axvalue(
+        el,
+        attr,
+        AXValueType::CGPoint,
+        NonNull::new(&mut p as *mut CGPoint as *mut c_void).unwrap(),
+    );
+    ok.then_some(p)
+}
+
+/// Read a `CGSize`-valued attribute (e.g. `AXSize`).
+pub fn attr_size(el: &AXUIElement, attr: &str) -> Option<CGSize> {
+    let mut s = CGSize::new(0.0, 0.0);
+    let ok = attr_axvalue(
+        el,
+        attr,
+        AXValueType::CGSize,
+        NonNull::new(&mut s as *mut CGSize as *mut c_void).unwrap(),
+    );
+    ok.then_some(s)
 }
