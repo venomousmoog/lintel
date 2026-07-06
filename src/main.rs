@@ -129,7 +129,35 @@ fn cmd_press(top: &str, item: &str) {
     eprintln!("Item '{top} > {item}' not found.");
 }
 
+/// When launched without a controlling terminal (e.g. via `open Lintel.app`), tee stdout/stderr
+/// to ~/Library/Logs/Lintel/lintel.log so `make logs` can tail them (`open` discards stdout).
+fn redirect_logs_if_detached() {
+    if unsafe { libc::isatty(1) } != 0 {
+        return; // has a terminal (e.g. `cargo run`) — leave output there
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let dir = format!("{home}/Library/Logs/Lintel");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(path) = std::ffi::CString::new(format!("{dir}/lintel.log")) {
+        unsafe {
+            let fd = libc::open(
+                path.as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+                0o644 as libc::c_int,
+            );
+            if fd >= 0 {
+                libc::dup2(fd, 1);
+                libc::dup2(fd, 2);
+                if fd > 2 {
+                    libc::close(fd);
+                }
+            }
+        }
+    }
+}
+
 fn cmd_run() {
+    redirect_logs_if_detached();
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
     // Don't exit if untrusted — keep running (status item stays up) and start working once
     // Accessibility is granted (the tick loop re-checks each frame).

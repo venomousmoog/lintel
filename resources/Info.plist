@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- CFBundleIdentifier is IMMUTABLE: macOS keys the Accessibility (TCC) grant on
+         (BundleID, code signature); changing it invalidates the grant. -->
+    <key>CFBundleIdentifier</key>
+    <string>com.ddriver.lintel</string>
+    <key>CFBundleName</key>
+    <string>Lintel</string>
+    <key>CFBundleDisplayName</key>
+    <string>Lintel</string>
+    <!-- Must match the executable filename in Contents/MacOS/. -->
+    <key>CFBundleExecutable</key>
+    <string>lintel</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.0</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.0</string>
+
+    <key>LSMinimumSystemVersion</key>
+    <string>26.0</string>
+
+    <!-- Background agent: no Dock icon, no app menu (controlled via its status-bar item). -->
+    <key>LSUIElement</key>
+    <true/>
+
+    <!-- Shown in the Accessibility prompt / Privacy pane. -->
+    <key>NSAccessibilityUsageDescription</key>
+    <string>Lintel needs Accessibility to read the focused app's menu bar and trigger menu items.</string>
+
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSSupportsAutomaticGraphicsSwitching</key>
+    <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026. All rights reserved.</string>
+</dict>
+</plist>

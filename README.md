@@ -46,19 +46,20 @@ has a public fallback). Two areas need early prototype spikes: behind-window blu
 Run in the **background** (recommended — no terminal, no Dock icon; quit from its menu-bar icon):
 
 ```sh
-scripts/bundle.sh                 # builds & signs Lintel.app
-open target/Lintel.app            # launches detached; a menu-bar icon appears (▸ Quit Lintel)
+make run          # builds + signs Lintel.app and launches it detached
+make logs         # tail its log (stdout is discarded when launched via `open`)
 ```
 
 First launch prompts for Accessibility (System Settings ▸ Privacy & Security ▸ Accessibility ▸
-enable Lintel); the bar appears automatically once granted. For the grant to survive rebuilds,
-sign with a stable identity — see `scripts/bundle.sh`.
+enable Lintel); the bar appears automatically once granted. So the grant **survives rebuilds**,
+create a stable signing identity once with `make cert` (otherwise the ad-hoc signature changes
+each rebuild and macOS re-prompts).
 
 Foreground / dev:
 
 ```sh
-cargo run                         # THE MVP in the foreground (Ctrl-C to quit)
-LINTEL_DEBUG=1 cargo run          # + placement debug logging on stderr
+make dev                          # THE MVP in the foreground (Ctrl-C to quit)
+LINTEL_DEBUG=1 make dev           # + placement debug logging on stderr
 cargo run -- read                 # (debug) print the frontmost app's menu bar
 cargo run -- press "File" "New"   # (debug) fire a first-level item in the frontmost app
 cargo run -- watch                # (debug) log focus/move/resize AX events
@@ -66,10 +67,6 @@ cargo run -- watch                # (debug) log focus/move/resize AX events
 
 Focus a normal (non-maximized) window and its menus appear in a bar just above it; click a menu
 to drop down its items and click one to trigger it.
-
-First use needs Accessibility permission: **System Settings ▸ Privacy & Security ▸ Accessibility**
-(the binary prompts if untrusted). For the grant to survive rebuilds, sign with a stable identity —
-see `scripts/bundle.sh`.
 
 ## Target
 
