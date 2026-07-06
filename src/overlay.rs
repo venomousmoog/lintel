@@ -21,8 +21,11 @@ use objc2_app_kit::{
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
     NSWindowStyleMask, NSWorkspace,
 };
-use objc2_application_services::AXUIElement;
-use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
+use objc2_application_services::{AXError, AXObserver, AXUIElement};
+use objc2_core_foundation::{
+    kCFRunLoopDefaultMode, CFEqual, CFRetained, CFRunLoop, CFRunLoopSource, CFString, CGPoint,
+    CGSize,
+};
 use objc2_foundation::{
     NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
 };
@@ -53,6 +56,53 @@ struct TopMenu {
     items: Vec<ItemEntry>,
 }
 
+/// An AXObserver watching the focused window's move/resize notifications so the bar follows
+/// event-driven (between 60 Hz ticks). Re-armed when the focused app or window changes; its
+/// Drop removes the run-loop source and notifications.
+struct MoveObserver {
+    observer: CFRetained<AXObserver>,
+    source: CFRetained<CFRunLoopSource>,
+    window: CFRetained<AXUIElement>,
+    pid: i32,
+}
+
+impl Drop for MoveObserver {
+    fn drop(&mut self) {
+        if let Some(rl) = CFRunLoop::current() {
+            rl.remove_source(Some(&self.source), unsafe { kCFRunLoopDefaultMode });
+        }
+        for n in [names::AX_WINDOW_MOVED, names::AX_WINDOW_RESIZED] {
+            unsafe {
+                let _ = self.observer.remove_notification(&self.window, &ax::cfstr(n));
+            }
+        }
+    }
+}
+
+/// AXObserver callback (main-thread, via the run-loop source): reposition the bar immediately
+/// on a window move/resize. `refcon` is a borrowed `*const Controller` (the Controller outlives
+/// every observer it owns). Must not unwind into AX.
+unsafe extern "C-unwind" fn ax_move_cb(
+    _observer: NonNull<AXObserver>,
+    _element: NonNull<AXUIElement>,
+    _notification: NonNull<CFString>,
+    refcon: *mut core::ffi::c_void,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if !refcon.is_null() {
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!("[dbg] ax_move_cb (observer fired)");
+            }
+            let controller = unsafe { &*(refcon as *const Controller) };
+            controller.reposition();
+        }
+    }));
+}
+
+fn same_element(a: &AXUIElement, b: &AXUIElement) -> bool {
+    CFEqual(Some(&**a), Some(&**b))
+}
+
 struct Inner {
     bar: Retained<NSPanel>,
     dropdown: Retained<NSPanel>,
@@ -63,6 +113,7 @@ struct Inner {
     status_item: Option<Retained<NSStatusItem>>,
     monitor: Option<Retained<AnyObject>>,
     last_frame: Option<(CGPoint, CGSize)>, // last focused-window frame we positioned to
+    move_obs: Option<MoveObserver>,        // event-driven window-move follow
 }
 
 pub struct Ivars {
@@ -119,6 +170,7 @@ impl Controller {
             status_item: None,
             monitor: None,
             last_frame: None,
+            move_obs: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -189,9 +241,8 @@ impl Controller {
         if std::env::var_os("LINTEL_DEBUG").is_some() {
             eprintln!("[dbg] close_dropdown");
         }
-        let inner = self.ivars().inner.borrow();
-        inner.dropdown.orderOut(None);
-        drop(inner);
+        let dropdown = self.ivars().inner.borrow().dropdown.clone();
+        dropdown.orderOut(None);
         self.ivars().inner.borrow_mut().open_top = None;
     }
 
@@ -218,26 +269,51 @@ impl Controller {
             self.hide_all();
             return;
         };
+        // Arm/refresh the event-driven move observer on the current window (re-arm only here,
+        // never inside the callback), then position (this is also the 60 Hz fallback).
+        self.ensure_observer(pid, &win);
+        self.position_bar(pid, &win);
+    }
+
+    /// Called from the AXObserver callback: re-read the tracked app's focused window and reposition
+    /// immediately, so drags follow without waiting for the next tick.
+    fn reposition(&self) {
+        let pid = self.ivars().inner.borrow().current_pid;
+        if pid == 0 {
+            return;
+        }
+        let app = ax::app_element(pid);
+        let Some(win) = ax::focused_window(&app) else {
+            return;
+        };
+        self.position_bar(pid, &win);
+    }
+
+    /// Read the window frame and move the bar (change-detected). Shared by the timer and the
+    /// AXObserver callback.
+    fn position_bar(&self, pid: i32, win: &AXUIElement) {
         let (Some(pos), Some(size)) = (
-            ax::attr_point(&win, names::AX_POSITION),
-            ax::attr_size(&win, names::AX_SIZE),
+            ax::attr_point(win, names::AX_POSITION),
+            ax::attr_size(win, names::AX_SIZE),
         ) else {
             self.hide_all();
             return;
         };
-
         if should_hide(self.mtm(), size) {
             self.hide_all();
             return;
         }
-
         let (x, y_top) = self.place(pos);
-        let mut inner = self.ivars().inner.borrow_mut();
-        // Only touch the panel when the window actually moved/resized (avoids 60 Hz churn).
-        if inner.last_frame == Some((pos, size)) {
-            return;
-        }
-        inner.last_frame = Some((pos, size));
+        // Clone the panel handle and release the borrow before AppKit calls (don't hold a
+        // RefCell borrow across calls that could re-enter via the observer callback).
+        let bar = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            if inner.last_frame == Some((pos, size)) {
+                return; // window hasn't moved/resized since we last positioned
+            }
+            inner.last_frame = Some((pos, size));
+            inner.bar.clone()
+        };
         if std::env::var_os("LINTEL_DEBUG").is_some() {
             eprintln!(
                 "[dbg] pid={pid} winpos=({:.0},{:.0}) winsize=({:.0},{:.0}) baro=({:.0},{:.0})",
@@ -245,8 +321,57 @@ impl Controller {
             );
         }
         // Bar sits WINDOW_GAP above the window's top edge (design v2 §8.2).
-        inner.bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
-        inner.bar.orderFront(None);
+        bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
+        bar.orderFront(None);
+    }
+
+    /// Ensure the move observer is watching the current focused window; re-arm on app/window change.
+    fn ensure_observer(&self, pid: i32, win: &AXUIElement) {
+        let need_arm = match &self.ivars().inner.borrow().move_obs {
+            Some(m) => m.pid != pid || !same_element(&m.window, win),
+            None => true,
+        };
+        if need_arm {
+            self.arm_move_observer(pid, win);
+        }
+    }
+
+    fn arm_move_observer(&self, pid: i32, win: &AXUIElement) {
+        let refcon = self as *const Controller as *mut core::ffi::c_void;
+        let mut raw: *mut AXObserver = core::ptr::null_mut();
+        let err =
+            unsafe { AXObserver::create(pid, Some(ax_move_cb), NonNull::new(&mut raw).unwrap()) };
+        if err != AXError::Success || raw.is_null() {
+            self.ivars().inner.borrow_mut().move_obs = None;
+            return;
+        }
+        if std::env::var_os("LINTEL_DEBUG").is_some() {
+            eprintln!("[dbg] arm_move_observer pid={pid}");
+        }
+        let observer = unsafe { CFRetained::from_raw(NonNull::new(raw).unwrap()) };
+        let mut registered = false;
+        for n in [names::AX_WINDOW_MOVED, names::AX_WINDOW_RESIZED] {
+            let err = unsafe { observer.add_notification(win, &ax::cfstr(n), refcon) };
+            registered |= err == AXError::Success;
+        }
+        if !registered {
+            // Couldn't subscribe (e.g. a momentarily-busy target); leave unarmed so a later
+            // tick retries, and fall back to the 60 Hz poll meanwhile.
+            self.ivars().inner.borrow_mut().move_obs = None;
+            return;
+        }
+        let source = unsafe { observer.run_loop_source() };
+        if let Some(rl) = CFRunLoop::current() {
+            rl.add_source(Some(&source), unsafe { kCFRunLoopDefaultMode });
+        }
+        let window = unsafe { CFRetained::retain(NonNull::from(win)) };
+        // Replacing drops the previous observer, whose Drop removes its source + notifications.
+        self.ivars().inner.borrow_mut().move_obs = Some(MoveObserver {
+            observer,
+            source,
+            window,
+            pid,
+        });
     }
 
     /// Read the app's menu bar (top-level + first-level) and rebuild the bar's buttons.
@@ -309,17 +434,19 @@ impl Controller {
         let fit = stack.fittingSize();
         let size = CGSize::new(fit.width, menu_bar_height() + BAR_V_MARGIN);
 
-        let inner_ref = self.ivars();
-        let mut inner = inner_ref.inner.borrow_mut();
-        inner.bar.setContentView(Some(&effect));
-        inner.bar.setContentSize(size);
+        let (bar, dropdown) = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.bar_size = size;
+            inner.model = model;
+            inner.current_pid = pid;
+            inner.open_top = None;
+            inner.last_frame = None; // bar size changed; reposition on the next tick
+            (inner.bar.clone(), inner.dropdown.clone())
+        };
+        bar.setContentView(Some(&effect));
+        bar.setContentSize(size);
         stack.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
-        inner.bar_size = size;
-        inner.model = model;
-        inner.current_pid = pid;
-        inner.open_top = None;
-        inner.last_frame = None; // bar size changed; reposition on the next tick
-        inner.dropdown.orderOut(None);
+        dropdown.orderOut(None);
     }
 
     fn on_top_clicked(&self, button: &NSButton) {
@@ -357,16 +484,18 @@ impl Controller {
         // The clicked title's left edge in screen coords, so the dropdown aligns under it.
         let in_win = button.convertRect_toView(button.bounds(), None);
 
-        let inner = self.ivars().inner.borrow_mut();
-        let on_screen = inner.bar.convertRectToScreen(in_win);
-        inner.dropdown.setContentView(Some(&effect));
-        inner.dropdown.setContentSize(size);
+        let (bar, dropdown) = {
+            let inner = self.ivars().inner.borrow();
+            (inner.bar.clone(), inner.dropdown.clone())
+        };
+        let on_screen = bar.convertRectToScreen(in_win);
+        dropdown.setContentView(Some(&effect));
+        dropdown.setContentSize(size);
         stack.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
-        let bar_frame = inner.bar.frame();
+        let bar_frame = bar.frame();
         let origin = NSPoint::new(on_screen.origin.x - 6.0, bar_frame.origin.y - size.height);
-        inner.dropdown.setFrameOrigin(origin);
-        inner.dropdown.orderFront(None);
-        drop(inner);
+        dropdown.setFrameOrigin(origin);
+        dropdown.orderFront(None);
         self.ivars().inner.borrow_mut().open_top = Some(idx);
     }
 
@@ -383,8 +512,8 @@ impl Controller {
             let err = ax::press(&el);
             println!("[lintel] AXPress -> {err:?}");
         }
-        let inner = self.ivars().inner.borrow();
-        inner.dropdown.orderOut(None);
+        let dropdown = self.ivars().inner.borrow().dropdown.clone();
+        dropdown.orderOut(None);
     }
 
     /// Convert an AX window position (global top-left, y-down) to the Cocoa y of the window's top
@@ -395,10 +524,13 @@ impl Controller {
     }
 
     fn hide_all(&self) {
-        let mut inner = self.ivars().inner.borrow_mut();
-        inner.bar.orderOut(None);
-        inner.dropdown.orderOut(None);
-        inner.last_frame = None; // force a reposition when we come back
+        let (bar, dropdown) = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.last_frame = None; // force a reposition when we come back
+            (inner.bar.clone(), inner.dropdown.clone())
+        };
+        bar.orderOut(None);
+        dropdown.orderOut(None);
     }
 }
 
