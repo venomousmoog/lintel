@@ -20,8 +20,9 @@ super-ultrawide you don't have to travel to the top-left of the screen to reach 
 focused window that mirrors its top-level menus, tracks the window as it moves (incl. across an
 ultrawide), hides when the window is fullscreen/maximized, and — clicking a menu drops down its
 first-level items and fires the real action via `AXPress`, without stealing focus. Verified
-visually against Chrome (bar renders + tracks; follows a window to x=5760 on a 7680px display).
-The click→drop-down→fire path is wired on the proven Phase 0 `AXPress` engine.
+visually against Chrome (bar renders + tracks; follows a window to x=5760 on a 7680px display)
+and via a synthesized click (opened the correct dropdown of first-level items, without stealing
+focus). Item→`AXPress` uses the engine already proven in Phase 0.
 
 **Phase 0 (walking skeleton)** — reads a foreign app's menu bar over Accessibility, fires a real
 action with `AXPress`, and wires an `AXObserver` on the main run loop. Verified against Chrome
