@@ -8,6 +8,7 @@
 //!   * presses the cached leaf element (no re-resolve-by-path yet — fine for static/native menus)
 
 use std::cell::RefCell;
+use std::time::{Duration, Instant};
 use core::ptr::NonNull;
 
 use block2::RcBlock;
@@ -36,6 +37,7 @@ const BAR_H: f64 = 24.0; // fallback; the real bar height tracks the system menu
 const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (design v2 §6.3)
 const NS_POPUP_LEVEL: isize = 101; // Lintel's own dropdown
 const TICK_INTERVAL: f64 = 1.0 / 60.0; // window-follow poll rate (~60 Hz; was 10 Hz)
+const SETTLE: Duration = Duration::from_millis(120); // how long the window must be still before re-showing
 const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
 const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
 const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
@@ -90,17 +92,21 @@ unsafe extern "C-unwind" fn ax_move_cb(
 ) {
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if !refcon.is_null() {
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!("[dbg] ax_move_cb (observer fired)");
-            }
             let controller = unsafe { &*(refcon as *const Controller) };
-            controller.reposition();
+            controller.begin_move();
         }
     }));
 }
 
 fn same_element(a: &AXUIElement, b: &AXUIElement) -> bool {
     CFEqual(Some(&**a), Some(&**b))
+}
+
+/// What a reconciliation step decided to do with the bar (executed after the RefCell borrow drops).
+enum Action {
+    Show(f64, f64, Retained<NSPanel>),
+    Hide(Retained<NSPanel>),
+    Nothing,
 }
 
 struct Inner {
@@ -112,8 +118,11 @@ struct Inner {
     open_top: Option<usize>,
     status_item: Option<Retained<NSStatusItem>>,
     monitor: Option<Retained<AnyObject>>,
-    last_frame: Option<(CGPoint, CGSize)>, // last focused-window frame we positioned to
-    move_obs: Option<MoveObserver>,        // event-driven window-move follow
+    last_frame: Option<(CGPoint, CGSize)>, // last focused-window frame we saw
+    move_obs: Option<MoveObserver>,        // event-driven move detection
+    moving: bool,                          // window is moving/resizing -> bar hidden
+    settle_at: Option<Instant>,            // re-show once the window is still past this instant
+    shown: bool,                           // bar is currently on screen
 }
 
 pub struct Ivars {
@@ -171,6 +180,9 @@ impl Controller {
             monitor: None,
             last_frame: None,
             move_obs: None,
+            moving: false,
+            settle_at: None,
+            shown: false,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -272,26 +284,34 @@ impl Controller {
         // Arm/refresh the event-driven move observer on the current window (re-arm only here,
         // never inside the callback), then position (this is also the 60 Hz fallback).
         self.ensure_observer(pid, &win);
-        self.position_bar(pid, &win);
+        self.reconcile(&win);
     }
 
-    /// Called from the AXObserver callback: re-read the tracked app's focused window and reposition
-    /// immediately, so drags follow without waiting for the next tick.
-    fn reposition(&self) {
-        let pid = self.ivars().inner.borrow().current_pid;
-        if pid == 0 {
-            return;
-        }
-        let app = ax::app_element(pid);
-        let Some(win) = ax::focused_window(&app) else {
-            return;
+    /// AXObserver callback: the focused window just started moving/resizing. Hide the bar at once
+    /// (so it never visibly chases) and mark it moving; the timer re-pins it once things settle.
+    fn begin_move(&self) {
+        let now = Instant::now();
+        let bar = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.moving = true;
+            inner.settle_at = Some(now + SETTLE);
+            inner.shown.then(|| {
+                inner.shown = false;
+                inner.bar.clone()
+            })
         };
-        self.position_bar(pid, &win);
+        if let Some(bar) = bar {
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!("[dbg] begin_move -> hide");
+            }
+            bar.orderOut(None);
+        }
     }
 
-    /// Read the window frame and move the bar (change-detected). Shared by the timer and the
-    /// AXObserver callback.
-    fn position_bar(&self, pid: i32, win: &AXUIElement) {
+    /// The 60 Hz reconciliation: show on a fresh focus, hide while the window is moving, and
+    /// re-pin once it has been still for `SETTLE`. Also the fallback for window-server moves
+    /// (Stage Manager / Spaces / tiling) that post no AX move events.
+    fn reconcile(&self, win: &AXUIElement) {
         let (Some(pos), Some(size)) = (
             ax::attr_point(win, names::AX_POSITION),
             ax::attr_size(win, names::AX_SIZE),
@@ -304,25 +324,62 @@ impl Controller {
             return;
         }
         let (x, y_top) = self.place(pos);
-        // Clone the panel handle and release the borrow before AppKit calls (don't hold a
-        // RefCell borrow across calls that could re-enter via the observer callback).
-        let bar = {
+        let now = Instant::now();
+        let action = {
             let mut inner = self.ivars().inner.borrow_mut();
-            if inner.last_frame == Some((pos, size)) {
-                return; // window hasn't moved/resized since we last positioned
+            let frame = (pos, size);
+            if inner.last_frame != Some(frame) {
+                let fresh = inner.last_frame.is_none();
+                inner.last_frame = Some(frame);
+                if fresh {
+                    // First frame for this window (focus change): show right away.
+                    inner.moving = false;
+                    inner.shown = true;
+                    Action::Show(x, y_top, inner.bar.clone())
+                } else {
+                    // Window moved/resized: hide and wait for it to settle.
+                    inner.moving = true;
+                    inner.settle_at = Some(now + SETTLE);
+                    if inner.shown {
+                        inner.shown = false;
+                        Action::Hide(inner.bar.clone())
+                    } else {
+                        Action::Nothing
+                    }
+                }
+            } else if inner.moving {
+                // Frame stable this tick; re-pin once it's been still long enough.
+                if inner.settle_at.map_or(true, |d| now >= d) {
+                    inner.moving = false;
+                    inner.shown = true;
+                    Action::Show(x, y_top, inner.bar.clone())
+                } else {
+                    Action::Nothing
+                }
+            } else if !inner.shown {
+                inner.shown = true;
+                Action::Show(x, y_top, inner.bar.clone())
+            } else {
+                Action::Nothing
             }
-            inner.last_frame = Some((pos, size));
-            inner.bar.clone()
         };
-        if std::env::var_os("LINTEL_DEBUG").is_some() {
-            eprintln!(
-                "[dbg] pid={pid} winpos=({:.0},{:.0}) winsize=({:.0},{:.0}) baro=({:.0},{:.0})",
-                pos.x, pos.y, size.width, size.height, x, y_top
-            );
+        let debug = std::env::var_os("LINTEL_DEBUG").is_some();
+        match action {
+            Action::Show(x, y_top, bar) => {
+                if debug {
+                    eprintln!("[dbg] show @ ({x:.0},{y_top:.0})");
+                }
+                bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
+                bar.orderFront(None);
+            }
+            Action::Hide(bar) => {
+                if debug {
+                    eprintln!("[dbg] hide (moving)");
+                }
+                bar.orderOut(None);
+            }
+            Action::Nothing => {}
         }
-        // Bar sits WINDOW_GAP above the window's top edge (design v2 §8.2).
-        bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
-        bar.orderFront(None);
     }
 
     /// Ensure the move observer is watching the current focused window; re-arm on app/window change.
@@ -526,7 +583,9 @@ impl Controller {
     fn hide_all(&self) {
         let (bar, dropdown) = {
             let mut inner = self.ivars().inner.borrow_mut();
-            inner.last_frame = None; // force a reposition when we come back
+            inner.last_frame = None; // force a fresh show when an eligible window returns
+            inner.moving = false;
+            inner.shown = false;
             (inner.bar.clone(), inner.dropdown.clone())
         };
         bar.orderOut(None);
