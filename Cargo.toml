@@ -16,8 +16,8 @@ version = "0.3.2"
 features = [
     "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView", "NSControl",
     "NSButton", "NSButtonCell", "NSStackView", "NSVisualEffectView", "NSScreen",
-    "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSFont",
-    "NSWorkspace", "NSRunningApplication",
+    "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSLayoutConstraint",
+    "NSFont", "NSStatusBar", "NSWorkspace", "NSRunningApplication",
 ]
 
 [dependencies.objc2-core-foundation]

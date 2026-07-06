@@ -13,20 +13,24 @@ use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSPanel, NSScreen, NSStackView,
-    NSUserInterfaceLayoutOrientation, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
-    NSWorkspace,
+    NSBackingStoreType, NSButton, NSColor, NSFont, NSLayoutAttribute, NSPanel, NSScreen,
+    NSStackView, NSStatusBar, NSUserInterfaceLayoutOrientation, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
+    NSWindowStyleMask, NSWorkspace,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::{CFRetained, CGPoint, CGSize};
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{
+    NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
+};
 
 use crate::ax::{self, names};
 
-const BAR_H: f64 = 26.0;
+const BAR_H: f64 = 24.0; // fallback; the real bar height tracks the system menu bar (§ menu_bar_height)
 const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (design v2 §6.3)
 const NS_POPUP_LEVEL: isize = 101; // Lintel's own dropdown
+const ITEM_SPACING: f64 = 16.0; // gap between top-level menu titles
+const BAR_EDGE: f64 = 10.0; // left/right padding inside the bar
 
 // ---- menu model (elements cached for the current app) -------------------------------------
 
@@ -176,8 +180,8 @@ impl Controller {
                 let Some(title) = ax::attr_string(&top, names::AX_TITLE) else {
                     continue;
                 };
-                if title.is_empty() {
-                    continue;
+                if title.is_empty() || title == "Apple" {
+                    continue; // leave the Apple menu on the real system menu bar
                 }
                 let items = ax::children(&top)
                     .into_iter()
@@ -200,14 +204,26 @@ impl Controller {
             }
         }
 
+        if std::env::var_os("LINTEL_DEBUG").is_some() {
+            eprintln!(
+                "[dbg] bar titles: {:?}",
+                model.iter().map(|t| t.title.as_str()).collect::<Vec<_>>()
+            );
+        }
+
         // Build a fresh acrylic content view with one button per top-level menu.
         let (effect, stack) = make_content(mtm, NSUserInterfaceLayoutOrientation::Horizontal);
+        let (font, bold) = menu_bar_fonts(mtm);
         let target: &AnyObject = self;
         for (i, top) in model.iter().enumerate() {
-            let btn = make_button(mtm, &top.title, target, sel!(topClicked:), i as isize);
+            // The app menu (first item, after the Apple menu is dropped) is bold, like macOS.
+            let f: &NSFont = if i == 0 { &bold } else { &font };
+            let btn = make_button(mtm, &top.title, f, target, sel!(topClicked:), i as isize);
             stack.addArrangedSubview(&btn);
         }
-        let size = stack.fittingSize();
+        // Width fits the titles; height matches the system menu bar (items centered via CenterY).
+        let fit = stack.fittingSize();
+        let size = CGSize::new(fit.width, menu_bar_height());
 
         let inner_ref = self.ivars();
         let mut inner = inner_ref.inner.borrow_mut();
@@ -224,6 +240,7 @@ impl Controller {
     fn on_top_clicked(&self, idx: usize) {
         let mtm = self.mtm();
         let (effect, stack) = make_content(mtm, NSUserInterfaceLayoutOrientation::Vertical);
+        let (font, _bold) = menu_bar_fonts(mtm);
         let target: &AnyObject = self;
         {
             let inner = self.ivars().inner.borrow();
@@ -234,7 +251,7 @@ impl Controller {
                 if it.is_sep {
                     continue;
                 }
-                let btn = make_button(mtm, &it.title, target, sel!(itemClicked:), j as isize);
+                let btn = make_button(mtm, &it.title, &font, target, sel!(itemClicked:), j as isize);
                 stack.addArrangedSubview(&btn);
             }
         }
@@ -321,7 +338,25 @@ fn make_content(
 
     let stack = NSStackView::new(mtm);
     stack.setOrientation(orient);
-    stack.setSpacing(2.0);
+    if orient == NSUserInterfaceLayoutOrientation::Horizontal {
+        stack.setSpacing(ITEM_SPACING);
+        stack.setAlignment(NSLayoutAttribute::CenterY);
+        stack.setEdgeInsets(NSEdgeInsets {
+            top: 0.0,
+            left: BAR_EDGE,
+            bottom: 0.0,
+            right: BAR_EDGE,
+        });
+    } else {
+        stack.setSpacing(1.0);
+        stack.setAlignment(NSLayoutAttribute::Leading);
+        stack.setEdgeInsets(NSEdgeInsets {
+            top: 3.0,
+            left: 6.0,
+            bottom: 3.0,
+            right: 6.0,
+        });
+    }
     effect.addSubview(&stack);
     (effect, stack)
 }
@@ -329,6 +364,7 @@ fn make_content(
 fn make_button(
     mtm: MainThreadMarker,
     title: &str,
+    font: &NSFont,
     target: &AnyObject,
     action: objc2::runtime::Sel,
     tag: isize,
@@ -337,8 +373,22 @@ fn make_button(
     let btn =
         unsafe { NSButton::buttonWithTitle_target_action(&ns, Some(target), Some(action), mtm) };
     btn.setBordered(false);
+    btn.setFont(Some(font));
     btn.setTag(tag);
     btn
+}
+
+/// The standard system menu-bar height.
+fn menu_bar_height() -> f64 {
+    NSStatusBar::systemStatusBar().thickness()
+}
+
+/// The system menu-bar font, in regular and bold (bold is used for the app menu, like macOS).
+fn menu_bar_fonts(mtm: MainThreadMarker) -> (Retained<NSFont>, Retained<NSFont>) {
+    let _ = mtm;
+    let regular = NSFont::menuBarFontOfSize(0.0);
+    let bold = NSFont::boldSystemFontOfSize(regular.pointSize());
+    (regular, bold)
 }
 
 fn frontmost_pid() -> Option<i32> {
