@@ -12,8 +12,8 @@ use objc2_application_services::{
     kAXTrustedCheckOptionPrompt,
 };
 use objc2_core_foundation::{
-    CFArray, CFBoolean, CFDictionary, CFRetained, CFString, CFType, CGPoint, CGSize, kCFBooleanTrue,
-    kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
+    CFArray, CFBoolean, CFDictionary, CFNumber, CFNumberType, CFRetained, CFString, CFType, CGPoint,
+    CGSize, kCFBooleanTrue, kCFTypeDictionaryKeyCallBacks, kCFTypeDictionaryValueCallBacks,
 };
 
 /// Verified AX name constants (subset used in Phase 0).
@@ -22,6 +22,8 @@ pub mod names {
     pub const AX_CHILDREN: &str = "AXChildren";
     pub const AX_TITLE: &str = "AXTitle";
     pub const AX_ENABLED: &str = "AXEnabled";
+    pub const AX_MENU_ITEM_CMD_CHAR: &str = "AXMenuItemCmdChar";
+    pub const AX_MENU_ITEM_CMD_MODIFIERS: &str = "AXMenuItemCmdModifiers";
     pub const AX_PRESS: &str = "AXPress";
     pub const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const AX_MAIN_WINDOW: &str = "AXMainWindow";
@@ -97,6 +99,15 @@ pub fn attr_string(el: &AXUIElement, attr: &str) -> Option<String> {
 pub fn attr_bool(el: &AXUIElement, attr: &str) -> Option<bool> {
     let v = copy_attr(el, attr)?;
     v.downcast_ref::<CFBoolean>().map(|b| b.value())
+}
+
+/// Read an integer attribute (e.g. `AXMenuItemCmdModifiers`).
+pub fn attr_i64(el: &AXUIElement, attr: &str) -> Option<i64> {
+    let v = copy_attr(el, attr)?;
+    let n = v.downcast_ref::<CFNumber>()?;
+    let mut out: i64 = 0;
+    let ok = unsafe { n.value(CFNumberType::SInt64Type, &mut out as *mut i64 as *mut c_void) };
+    ok.then_some(out)
 }
 
 /// Read an element-valued attribute (e.g. `AXMenuBar`).

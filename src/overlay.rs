@@ -1,23 +1,23 @@
-//! Phase 1 MVP overlay: a floating acrylic bar pinned above the focused window that mirrors the
-//! top-level menus; clicking a menu drops down its first-level items and fires the real action via
-//! `AXPress`. Timer-driven (the reconciliation loop of design v2 §5.3 as the MVP's primary driver).
+//! The overlay: a floating acrylic bar pinned above the focused window that mirrors its top-level
+//! menus. Clicking a top menu pops a native `NSMenu` (so the system font, separators, right-aligned
+//! shortcut column, and disabled greying come for free); selecting an item fires the real action
+//! via `AXPress`.
 //!
-//! Simplifications vs the full design (tracked as TODO for later phases):
-//!   * one reconciliation timer instead of AXObservers (§5.2)
-//!   * dropdown left-aligned under the bar, not under the clicked item; single level deep
-//!   * presses the cached leaf element (no re-resolve-by-path yet — fine for static/native menus)
+//! Window-follow hides the bar during a move/resize (AXObserver -> begin_move) and re-pins it once
+//! the window settles, driven by the 60 Hz timer (which is also the fallback for window-server
+//! moves that post no AX events). Single menu level for now; presses the cached leaf element (no
+//! re-resolve-by-path yet — fine for static/native menus).
 
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use core::ptr::NonNull;
 
-use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventMask, NSFont, NSImage, NSLayoutAttribute,
-    NSMenu, NSPanel, NSScreen, NSStackView, NSStatusBar, NSStatusItem,
+    NSBackingStoreType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSImage, NSLayoutAttribute,
+    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar, NSStatusItem,
     NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
     NSWindowStyleMask, NSWorkspace,
@@ -35,7 +35,6 @@ use crate::ax::{self, names};
 
 const BAR_H: f64 = 24.0; // fallback; the real bar height tracks the system menu bar (§ menu_bar_height)
 const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (design v2 §6.3)
-const NS_POPUP_LEVEL: isize = 101; // Lintel's own dropdown
 const TICK_INTERVAL: f64 = 1.0 / 60.0; // window-follow poll rate (~60 Hz; was 10 Hz)
 const SETTLE: Duration = Duration::from_millis(120); // how long the window must be still before re-showing
 const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
@@ -47,15 +46,39 @@ const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
 
 // ---- menu model (elements cached for the current app) -------------------------------------
 
+struct Shortcut {
+    key: String,               // the key-equivalent character (lowercased)
+    mods: NSEventModifierFlags, // modifier flags to render (⌘⇧⌥⌃)
+}
 struct ItemEntry {
     title: String,
     el: CFRetained<AXUIElement>,
     is_sep: bool,
     enabled: bool,
+    shortcut: Option<Shortcut>,
 }
 struct TopMenu {
     title: String,
     items: Vec<ItemEntry>,
+}
+
+/// Translate the AX menu-item modifier bitmask (Shift=1, Option=2, Control=4, NoCommand=8;
+/// Command implied unless the NoCommand bit is set) into `NSEventModifierFlags`.
+fn ax_mods_to_ns(axmods: i64) -> NSEventModifierFlags {
+    let mut m = NSEventModifierFlags::empty();
+    if axmods & 1 != 0 {
+        m |= NSEventModifierFlags::Shift;
+    }
+    if axmods & 2 != 0 {
+        m |= NSEventModifierFlags::Option;
+    }
+    if axmods & 4 != 0 {
+        m |= NSEventModifierFlags::Control;
+    }
+    if axmods & 8 == 0 {
+        m |= NSEventModifierFlags::Command; // Command is implied unless NoCommand is set
+    }
+    m
 }
 
 /// An AXObserver watching the focused window's move/resize notifications so the bar follows
@@ -111,13 +134,11 @@ enum Action {
 
 struct Inner {
     bar: Retained<NSPanel>,
-    dropdown: Retained<NSPanel>,
     model: Vec<TopMenu>,
     current_pid: i32,
     bar_size: CGSize,
-    open_top: Option<usize>,
+    open_top: Option<usize>, // which top-level menu the open NSMenu belongs to
     status_item: Option<Retained<NSStatusItem>>,
-    monitor: Option<Retained<AnyObject>>,
     last_frame: Option<(CGPoint, CGSize)>, // last focused-window frame we saw
     move_obs: Option<MoveObserver>,        // event-driven move detection
     moving: bool,                          // window is moving/resizing -> bar hidden
@@ -168,16 +189,13 @@ define_class!(
 impl Controller {
     pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
         let bar = make_panel(mtm, NS_STATUS_LEVEL);
-        let dropdown = make_panel(mtm, NS_POPUP_LEVEL);
         let inner = Inner {
             bar,
-            dropdown,
             model: Vec::new(),
             current_pid: 0,
             bar_size: CGSize::new(0.0, BAR_H),
             open_top: None,
             status_item: None,
-            monitor: None,
             last_frame: None,
             move_obs: None,
             moving: false,
@@ -190,10 +208,9 @@ impl Controller {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Install the menu-bar status item, the click-away monitor, and the ~10 Hz timer.
+    /// Install the menu-bar status item and start the window-follow timer.
     pub fn start(&self) {
         self.setup_status_item();
-        self.setup_click_away();
         unsafe {
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 TICK_INTERVAL,
@@ -235,27 +252,6 @@ impl Controller {
         }
         item.setMenu(Some(&menu));
         self.ivars().inner.borrow_mut().status_item = Some(item);
-    }
-
-    /// A global mouse-down monitor that dismisses the dropdown when the user clicks anywhere
-    /// outside Lintel's own windows (clicks on our bar/dropdown are local, so they don't fire it).
-    fn setup_click_away(&self) {
-        let this = self.retain();
-        let handler = RcBlock::new(move |_ev: NonNull<NSEvent>| {
-            this.close_dropdown();
-        });
-        let mask = NSEventMask::LeftMouseDown | NSEventMask::RightMouseDown;
-        let token = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(mask, &handler);
-        self.ivars().inner.borrow_mut().monitor = token;
-    }
-
-    fn close_dropdown(&self) {
-        if std::env::var_os("LINTEL_DEBUG").is_some() {
-            eprintln!("[dbg] close_dropdown");
-        }
-        let dropdown = self.ivars().inner.borrow().dropdown.clone();
-        dropdown.orderOut(None);
-        self.ivars().inner.borrow_mut().open_top = None;
     }
 
     fn on_tick(&self) {
@@ -367,7 +363,7 @@ impl Controller {
         match action {
             Action::Show(x, y_top, bar) => {
                 if debug {
-                    eprintln!("[dbg] show @ ({x:.0},{y_top:.0})");
+                    eprintln!("[dbg] show winpos=({:.0},{:.0}) baro=({x:.0},{y_top:.0})", pos.x, pos.y);
                 }
                 bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
                 bar.orderFront(None);
@@ -454,11 +450,20 @@ impl Controller {
                             .into_iter()
                             .map(|mi| {
                                 let t = ax::attr_string(&mi, names::AX_TITLE).unwrap_or_default();
-                                let enabled =
-                                    ax::attr_bool(&mi, names::AX_ENABLED).unwrap_or(true);
+                                let enabled = ax::attr_bool(&mi, names::AX_ENABLED).unwrap_or(true);
+                                let shortcut = ax::attr_string(&mi, names::AX_MENU_ITEM_CMD_CHAR)
+                                    .filter(|c| !c.is_empty())
+                                    .map(|c| Shortcut {
+                                        key: c.to_lowercase(),
+                                        mods: ax_mods_to_ns(
+                                            ax::attr_i64(&mi, names::AX_MENU_ITEM_CMD_MODIFIERS)
+                                                .unwrap_or(0),
+                                        ),
+                                    });
                                 ItemEntry {
                                     is_sep: t.is_empty(),
                                     enabled,
+                                    shortcut,
                                     title: t,
                                     el: mi,
                                 }
@@ -478,7 +483,7 @@ impl Controller {
         }
 
         // Build a fresh acrylic content view with one button per top-level menu.
-        let (effect, stack) = make_content(mtm, NSUserInterfaceLayoutOrientation::Horizontal);
+        let (effect, stack) = make_content(mtm);
         let (font, bold) = menu_bar_fonts(mtm);
         let target: &AnyObject = self;
         for (i, top) in model.iter().enumerate() {
@@ -491,69 +496,65 @@ impl Controller {
         let fit = stack.fittingSize();
         let size = CGSize::new(fit.width, menu_bar_height() + BAR_V_MARGIN);
 
-        let (bar, dropdown) = {
+        let bar = {
             let mut inner = self.ivars().inner.borrow_mut();
             inner.bar_size = size;
             inner.model = model;
             inner.current_pid = pid;
             inner.open_top = None;
             inner.last_frame = None; // bar size changed; reposition on the next tick
-            (inner.bar.clone(), inner.dropdown.clone())
+            inner.bar.clone()
         };
         bar.setContentView(Some(&effect));
         bar.setContentSize(size);
         stack.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
-        dropdown.orderOut(None);
     }
 
     fn on_top_clicked(&self, button: &NSButton) {
         let idx = button.tag() as usize;
-        if std::env::var_os("LINTEL_DEBUG").is_some() {
-            eprintln!("[dbg] top_clicked idx={idx}");
-        }
         let mtm = self.mtm();
-        let (effect, stack) = make_content(mtm, NSUserInterfaceLayoutOrientation::Vertical);
-        let (font, _bold) = menu_bar_fonts(mtm);
+
+        // Build a native NSMenu mirroring this top-level menu — the system menu font, separators,
+        // right-aligned shortcut column, and disabled greying all come for free.
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false); // honor our explicit per-item enabled state
         let target: &AnyObject = self;
-        {
+        let bar = {
             let inner = self.ivars().inner.borrow();
             let Some(top) = inner.model.get(idx) else {
                 return;
             };
             for (j, it) in top.items.iter().enumerate() {
                 if it.is_sep {
+                    menu.addItem(&NSMenuItem::separatorItem(mtm));
                     continue;
                 }
-                let btn = make_button(
-                    mtm,
-                    &it.title,
-                    &font,
-                    it.enabled,
-                    target,
-                    sel!(itemClicked:),
-                    j as isize,
-                );
-                stack.addArrangedSubview(&btn);
+                let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
+                let item = unsafe {
+                    menu.addItemWithTitle_action_keyEquivalent(
+                        &NSString::from_str(&it.title),
+                        Some(sel!(itemClicked:)),
+                        &NSString::from_str(key),
+                    )
+                };
+                if let Some(s) = &it.shortcut {
+                    item.setKeyEquivalentModifierMask(s.mods);
+                }
+                item.setEnabled(it.enabled);
+                item.setTag(j as isize);
+                unsafe { item.setTarget(Some(target)) };
             }
-        }
-        let size = stack.fittingSize();
-
-        // The clicked title's left edge in screen coords, so the dropdown aligns under it.
-        let in_win = button.convertRect_toView(button.bounds(), None);
-
-        let (bar, dropdown) = {
-            let inner = self.ivars().inner.borrow();
-            (inner.bar.clone(), inner.dropdown.clone())
+            inner.bar.clone()
         };
-        let on_screen = bar.convertRectToScreen(in_win);
-        dropdown.setContentView(Some(&effect));
-        dropdown.setContentSize(size);
-        stack.setFrame(NSRect::new(NSPoint::new(0.0, 0.0), size));
-        let bar_frame = bar.frame();
-        let origin = NSPoint::new(on_screen.origin.x - 6.0, bar_frame.origin.y - size.height);
-        dropdown.setFrameOrigin(origin);
-        dropdown.orderFront(None);
         self.ivars().inner.borrow_mut().open_top = Some(idx);
+
+        // Pop it up just under the clicked title (screen coords = the button's bottom-left).
+        let scr = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
+        menu.popUpMenuPositioningItem_atLocation_inView(
+            None,
+            NSPoint::new(scr.origin.x, scr.origin.y),
+            None,
+        );
     }
 
     fn on_item_clicked(&self, j: usize) {
@@ -569,8 +570,6 @@ impl Controller {
             let err = ax::press(&el);
             println!("[lintel] AXPress -> {err:?}");
         }
-        let dropdown = self.ivars().inner.borrow().dropdown.clone();
-        dropdown.orderOut(None);
     }
 
     /// Convert an AX window position (global top-left, y-down) to the Cocoa y of the window's top
@@ -581,15 +580,14 @@ impl Controller {
     }
 
     fn hide_all(&self) {
-        let (bar, dropdown) = {
+        let bar = {
             let mut inner = self.ivars().inner.borrow_mut();
             inner.last_frame = None; // force a fresh show when an eligible window returns
             inner.moving = false;
             inner.shown = false;
-            (inner.bar.clone(), inner.dropdown.clone())
+            inner.bar.clone()
         };
         bar.orderOut(None);
-        dropdown.orderOut(None);
     }
 }
 
@@ -617,10 +615,8 @@ fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     panel
 }
 
-fn make_content(
-    mtm: MainThreadMarker,
-    orient: NSUserInterfaceLayoutOrientation,
-) -> (Retained<NSVisualEffectView>, Retained<NSStackView>) {
+/// The bar's acrylic content view + a horizontal stack for the top-level menu buttons.
+fn make_content(mtm: MainThreadMarker) -> (Retained<NSVisualEffectView>, Retained<NSStackView>) {
     let effect = NSVisualEffectView::new(mtm);
     effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
@@ -633,26 +629,15 @@ fn make_content(
     }
 
     let stack = NSStackView::new(mtm);
-    stack.setOrientation(orient);
-    if orient == NSUserInterfaceLayoutOrientation::Horizontal {
-        stack.setSpacing(ITEM_SPACING);
-        stack.setAlignment(NSLayoutAttribute::CenterY);
-        stack.setEdgeInsets(NSEdgeInsets {
-            top: 0.0,
-            left: BAR_EDGE,
-            bottom: 0.0,
-            right: BAR_EDGE,
-        });
-    } else {
-        stack.setSpacing(1.0);
-        stack.setAlignment(NSLayoutAttribute::Leading);
-        stack.setEdgeInsets(NSEdgeInsets {
-            top: 3.0,
-            left: 6.0,
-            bottom: 3.0,
-            right: 6.0,
-        });
-    }
+    stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+    stack.setSpacing(ITEM_SPACING);
+    stack.setAlignment(NSLayoutAttribute::CenterY);
+    stack.setEdgeInsets(NSEdgeInsets {
+        top: 0.0,
+        left: BAR_EDGE,
+        bottom: 0.0,
+        right: BAR_EDGE,
+    });
     effect.addSubview(&stack);
     (effect, stack)
 }
