@@ -158,6 +158,7 @@ struct Inner {
     buttons: Vec<Retained<NSButton>>,      // the top-level title buttons (for hover hit-testing)
     open_menu: Option<Retained<NSMenu>>,   // the currently-tracking dropdown (to cancel on switch)
     pending_switch: Option<usize>,         // peer title to open after cancelling the current one
+    menus_right_edge: f64,                  // AX x where the real system menus end (Apple + app menus)
 }
 
 pub struct Ivars {
@@ -224,6 +225,7 @@ impl Controller {
             buttons: Vec::new(),
             open_menu: None,
             pending_switch: None,
+            menus_right_edge: 0.0,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -353,13 +355,22 @@ impl Controller {
             self.hide_all();
             return;
         }
-        // Hide if the bar would reach up into the system menu-bar strip (window too near the top
-        // of the primary display) — don't cover the real menus. `pos.y` is AX top-left (0 at the
-        // top of the primary display); the bar sits `WINDOW_GAP + bar height` above the window.
-        let bar_h = self.ivars().inner.borrow().bar_size.height;
-        if pos.y < menu_bar_height() + WINDOW_GAP + bar_h {
+        // Hide only when the bar would overlap the actual system MENUS (top-left): vertically
+        // within the menu-bar strip AND horizontally within the app menus' extent. A window near
+        // the top but off to the side (bar over empty menu-bar space) still shows and overlaps.
+        // `pos` is AX top-left (0,0 = top-left of the primary display).
+        let (bar_h, menus_right) = {
+            let inner = self.ivars().inner.borrow();
+            (inner.bar_size.height, inner.menus_right_edge)
+        };
+        let in_strip = pos.y < menu_bar_height() + WINDOW_GAP + bar_h;
+        let over_menus = pos.x < menus_right;
+        if in_strip && over_menus {
             if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!("[dbg] hide: bar would overlap menu bar (winpos.y={:.0})", pos.y);
+                eprintln!(
+                    "[dbg] hide: bar over system menus (winpos=({:.0},{:.0}), menus_right={:.0})",
+                    pos.x, pos.y, menus_right
+                );
             }
             self.hide_all();
             return;
@@ -479,8 +490,17 @@ impl Controller {
         ax::set_timeout(&app, 1.0);
 
         let mut model = Vec::new();
+        let mut menus_right = 0.0_f64; // right edge of the real system menus (Apple + app menus)
         if let Some(menubar) = ax::attr_element(&app, names::AX_MENU_BAR) {
             for top in ax::children(&menubar) {
+                // Track the real menus' horizontal extent (include the Apple menu) so we only hide
+                // when the bar would actually cover them, not just for being near the top.
+                if let (Some(p), Some(s)) = (
+                    ax::attr_point(&top, names::AX_POSITION),
+                    ax::attr_size(&top, names::AX_SIZE),
+                ) {
+                    menus_right = menus_right.max(p.x + s.width);
+                }
                 let Some(title) = ax::attr_string(&top, names::AX_TITLE) else {
                     continue;
                 };
@@ -552,6 +572,7 @@ impl Controller {
             inner.last_frame = None; // bar size changed; reposition on the next tick
             inner.highlight = Some(highlight);
             inner.buttons = buttons;
+            inner.menus_right_edge = menus_right;
             inner.bar.clone()
         };
         bar.setContentView(Some(&effect));
