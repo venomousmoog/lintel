@@ -21,7 +21,7 @@ use objc2_app_kit::{
     NSBackingStoreType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSFontAttributeName,
     NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel,
     NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSUserInterfaceLayoutOrientation,
-    NSVariableStatusItemLength, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
     NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
     NSWorkspace,
 };
@@ -46,6 +46,7 @@ const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
 const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
 const FONT_SIZE: f64 = 13.0; // ~ the system menu-bar font size
 const MENU_LEFT_ADJUST: f64 = -13.0; // shift the dropdown left so its item text lines up under the title text
+const PILL_MARGIN: f64 = 10.0; // horizontal padding of the active-title highlight pill
 const CORNER_RADIUS: f64 = 12.0; // matches the macOS window corner radius (rounds the bar's ends)
 const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
 // Nudge the popped menu down so its visual top clears the bar's bottom edge. NSMenu renders its
@@ -152,6 +153,7 @@ struct Inner {
     moving: bool,                          // window is moving/resizing -> bar hidden
     settle_at: Option<Instant>,            // re-show once the window is still past this instant
     shown: bool,                           // bar is currently on screen
+    highlight: Option<Retained<NSView>>,   // pill behind the active title while its menu is open
 }
 
 pub struct Ivars {
@@ -209,6 +211,7 @@ impl Controller {
             moving: false,
             settle_at: None,
             shown: false,
+            highlight: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -324,6 +327,17 @@ impl Controller {
             return;
         };
         if should_hide(self.mtm(), size) {
+            self.hide_all();
+            return;
+        }
+        // Hide if the bar would reach up into the system menu-bar strip (window too near the top
+        // of the primary display) — don't cover the real menus. `pos.y` is AX top-left (0 at the
+        // top of the primary display); the bar sits `WINDOW_GAP + bar height` above the window.
+        let bar_h = self.ivars().inner.borrow().bar_size.height;
+        if pos.y < menu_bar_height() + WINDOW_GAP + bar_h {
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!("[dbg] hide: bar would overlap menu bar (winpos.y={:.0})", pos.y);
+            }
             self.hide_all();
             return;
         }
@@ -491,7 +505,7 @@ impl Controller {
         }
 
         // Build a fresh acrylic content view with one button per top-level menu.
-        let (effect, stack) = make_content(mtm);
+        let (effect, stack, highlight) = make_content(mtm);
         let (font, bold) = menu_bar_fonts(mtm);
         let target: &AnyObject = self;
         for (i, top) in model.iter().enumerate() {
@@ -511,6 +525,7 @@ impl Controller {
             inner.current_pid = pid;
             inner.open_top = None;
             inner.last_frame = None; // bar size changed; reposition on the next tick
+            inner.highlight = Some(highlight);
             inner.bar.clone()
         };
         bar.setContentView(Some(&effect));
@@ -568,17 +583,24 @@ impl Controller {
             bar_frame.origin.y - MENU_DROP,
         );
 
-        // Highlight the active title with a rounded bubble while its menu is open (popUp blocks
-        // in a modal tracking loop, so we set the highlight before and clear it after).
-        button.setWantsLayer(true);
-        if let Some(layer) = button.layer() {
-            let cg = NSColor::unemphasizedSelectedContentBackgroundColor().CGColor();
-            layer.setBackgroundColor(Some(&cg));
-            layer.setCornerRadius(5.0);
+        // Show the highlight pill behind the active title while its menu is open (popUp blocks in
+        // a modal tracking loop, so we show it before and hide it after). The pill spans the full
+        // bar height with the bar's corner radius, plus horizontal margin around the text.
+        let (hl, bar_h) = {
+            let inner = self.ivars().inner.borrow();
+            (inner.highlight.clone(), inner.bar_size.height)
+        };
+        if let Some(hl) = &hl {
+            let bf = button.frame();
+            hl.setFrame(NSRect::new(
+                NSPoint::new(bf.origin.x - PILL_MARGIN, 0.0),
+                NSSize::new(bf.size.width + 2.0 * PILL_MARGIN, bar_h),
+            ));
+            hl.setHidden(false);
         }
         menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
-        if let Some(layer) = button.layer() {
-            layer.setBackgroundColor(None);
+        if let Some(hl) = &hl {
+            hl.setHidden(true);
         }
     }
 
@@ -631,7 +653,7 @@ fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     panel.setLevel(level);
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
-    panel.setHasShadow(false); // no black outline; the rounded acrylic view is the whole visual
+    panel.setHasShadow(true); // soft drop shadow around the rounded acrylic bar
     panel.setCollectionBehavior(
         NSWindowCollectionBehavior::MoveToActiveSpace
             | NSWindowCollectionBehavior::Stationary
@@ -640,8 +662,14 @@ fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     panel
 }
 
-/// The bar's acrylic content view + a horizontal stack for the top-level menu buttons.
-fn make_content(mtm: MainThreadMarker) -> (Retained<NSVisualEffectView>, Retained<NSStackView>) {
+/// The bar's acrylic content view, a highlight pill (behind), and the horizontal stack of titles.
+fn make_content(
+    mtm: MainThreadMarker,
+) -> (
+    Retained<NSVisualEffectView>,
+    Retained<NSStackView>,
+    Retained<NSView>,
+) {
     let effect = NSVisualEffectView::new(mtm);
     effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
@@ -652,6 +680,20 @@ fn make_content(mtm: MainThreadMarker) -> (Retained<NSVisualEffectView>, Retaine
         layer.setCornerRadius(CORNER_RADIUS);
         layer.setMasksToBounds(true);
     }
+
+    // Highlight pill (added first so it sits behind the titles); positioned + shown on click.
+    let highlight = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)));
+    highlight.setWantsLayer(true);
+    if let Some(layer) = highlight.layer() {
+        // A slight tint of the system accent color.
+        let cg = NSColor::controlAccentColor()
+            .colorWithAlphaComponent(0.25)
+            .CGColor();
+        layer.setBackgroundColor(Some(&cg));
+        layer.setCornerRadius(CORNER_RADIUS);
+    }
+    highlight.setHidden(true);
+    effect.addSubview(&highlight);
 
     let stack = NSStackView::new(mtm);
     stack.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
@@ -664,7 +706,7 @@ fn make_content(mtm: MainThreadMarker) -> (Retained<NSVisualEffectView>, Retaine
         right: BAR_EDGE,
     });
     effect.addSubview(&stack);
-    (effect, stack)
+    (effect, stack, highlight)
 }
 
 #[allow(clippy::too_many_arguments)]
