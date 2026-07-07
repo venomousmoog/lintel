@@ -47,6 +47,7 @@ const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (verti
 const FONT_SIZE: f64 = 13.0; // ~ the system menu-bar font size
 const MENU_LEFT_ADJUST: f64 = -13.0; // shift the dropdown left so its item text lines up under the title text
 const PILL_MARGIN: f64 = 10.0; // horizontal padding of the active-title highlight pill
+const PILL_V_INSET: f64 = 2.0; // top/bottom inset so the pill doesn't touch the bar edges
 const CORNER_RADIUS: f64 = 12.0; // matches the macOS window corner radius (rounds the bar's ends)
 const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
 // Nudge the popped menu down so its visual top clears the bar's bottom edge. NSMenu renders its
@@ -593,8 +594,8 @@ impl Controller {
         if let Some(hl) = &hl {
             let bf = button.frame();
             hl.setFrame(NSRect::new(
-                NSPoint::new(bf.origin.x - PILL_MARGIN, 0.0),
-                NSSize::new(bf.size.width + 2.0 * PILL_MARGIN, bar_h),
+                NSPoint::new(bf.origin.x - PILL_MARGIN, PILL_V_INSET),
+                NSSize::new(bf.size.width + 2.0 * PILL_MARGIN, bar_h - 2.0 * PILL_V_INSET),
             ));
             hl.setHidden(false);
         }
