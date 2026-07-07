@@ -43,7 +43,9 @@ const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (verti
 const FONT_SIZE: f64 = 15.0; // slightly larger than the default menu-bar font
 const CORNER_RADIUS: f64 = 12.0; // matches the macOS window corner radius (rounds the bar's ends)
 const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
-const BAR_ALPHA: f64 = 0.9; // bar opacity (slightly translucent)
+// Nudge the popped menu down so its visual top clears the bar's bottom edge. NSMenu renders its
+// top chrome a few points above the requested location, which otherwise overlaps the bar.
+const MENU_DROP: f64 = 10.0;
 
 // ---- menu model (elements cached for the current app) -------------------------------------
 
@@ -554,7 +556,8 @@ impl Controller {
         // top-left lands at `loc` and it grows downward.
         let btn = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
         let bar_frame = bar.frame();
-        let loc = NSPoint::new(btn.origin.x, bar_frame.origin.y);
+        // MENU_DROP pushes the menu below the bar's bottom edge (see the const).
+        let loc = NSPoint::new(btn.origin.x, bar_frame.origin.y - MENU_DROP);
         menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
     }
 
@@ -607,7 +610,6 @@ fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     panel.setLevel(level);
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
-    panel.setAlphaValue(BAR_ALPHA); // slightly translucent
     panel.setHasShadow(false); // no black outline; the rounded acrylic view is the whole visual
     panel.setCollectionBehavior(
         NSWindowCollectionBehavior::MoveToActiveSpace
