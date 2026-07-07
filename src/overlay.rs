@@ -18,12 +18,12 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSFontAttributeName,
-    NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel,
-    NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSUserInterfaceLayoutOrientation,
-    NSVariableStatusItemLength, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
-    NSWorkspace,
+    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventModifierFlags, NSFont,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSMenu,
+    NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar, NSStatusItem,
+    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_application_services::{AXError, AXObserver, AXUIElement};
 use objc2_core_foundation::{
@@ -32,7 +32,7 @@ use objc2_core_foundation::{
 };
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSSize, NSString, NSTimer,
+    NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 
 use crate::ax::{self, names};
@@ -155,6 +155,9 @@ struct Inner {
     settle_at: Option<Instant>,            // re-show once the window is still past this instant
     shown: bool,                           // bar is currently on screen
     highlight: Option<Retained<NSView>>,   // pill behind the active title while its menu is open
+    buttons: Vec<Retained<NSButton>>,      // the top-level title buttons (for hover hit-testing)
+    open_menu: Option<Retained<NSMenu>>,   // the currently-tracking dropdown (to cancel on switch)
+    pending_switch: Option<usize>,         // peer title to open after cancelling the current one
 }
 
 pub struct Ivars {
@@ -190,6 +193,11 @@ define_class!(
             }
         }
 
+        #[unsafe(method(checkSwitch:))]
+        fn check_switch_(&self, _timer: &NSTimer) {
+            self.check_switch();
+        }
+
         #[unsafe(method(quitLintel:))]
         fn quit_(&self, _sender: Option<&AnyObject>) {
             std::process::exit(0);
@@ -213,6 +221,9 @@ impl Controller {
             settle_at: None,
             shown: false,
             highlight: None,
+            buttons: Vec::new(),
+            open_menu: None,
+            pending_switch: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -220,10 +231,11 @@ impl Controller {
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Install the menu-bar status item and start the window-follow timer.
+    /// Install the menu-bar status item and start the timers.
     pub fn start(&self) {
         self.setup_status_item();
         unsafe {
+            // Window-follow reconciliation (default mode; paused while a menu tracks).
             NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 TICK_INTERVAL,
                 self,
@@ -231,6 +243,16 @@ impl Controller {
                 None,
                 true,
             );
+            // Hover switch-watcher, in COMMON modes so it also fires during the menu's modal
+            // tracking loop — lets us switch menus when the mouse moves to a peer title.
+            let watcher = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                0.02,
+                self,
+                sel!(checkSwitch:),
+                None,
+                true,
+            );
+            NSRunLoop::currentRunLoop().addTimer_forMode(&watcher, NSRunLoopCommonModes);
         }
     }
 
@@ -509,11 +531,13 @@ impl Controller {
         let (effect, stack, highlight) = make_content(mtm);
         let (font, bold) = menu_bar_fonts(mtm);
         let target: &AnyObject = self;
+        let mut buttons = Vec::with_capacity(model.len());
         for (i, top) in model.iter().enumerate() {
             // The app menu (first item, after the Apple menu is dropped) is bold, like macOS.
             let f: &NSFont = if i == 0 { &bold } else { &font };
             let btn = make_button(mtm, &top.title, f, true, target, sel!(topClicked:), i as isize);
             stack.addArrangedSubview(&btn);
+            buttons.push(btn);
         }
         // Width fits the titles; height is the system menu bar plus a little vertical margin.
         let fit = stack.fittingSize();
@@ -527,6 +551,7 @@ impl Controller {
             inner.open_top = None;
             inner.last_frame = None; // bar size changed; reposition on the next tick
             inner.highlight = Some(highlight);
+            inner.buttons = buttons;
             inner.bar.clone()
         };
         bar.setContentView(Some(&effect));
@@ -535,73 +560,125 @@ impl Controller {
     }
 
     fn on_top_clicked(&self, button: &NSButton) {
-        let idx = button.tag() as usize;
-        let mtm = self.mtm();
+        self.open_menu_at(button.tag() as usize);
+    }
 
-        // Build a native NSMenu mirroring this top-level menu — the system menu font, separators,
-        // right-aligned shortcut column, and disabled greying all come for free.
-        let menu = NSMenu::new(mtm);
-        menu.setAutoenablesItems(false); // honor our explicit per-item enabled state
-        let target: &AnyObject = self;
-        let bar = {
-            let inner = self.ivars().inner.borrow();
-            let Some(top) = inner.model.get(idx) else {
+    /// Open the top-level menu at `first`, then keep switching whenever the hover watcher
+    /// (`check_switch`) cancels the current menu because the mouse moved to a peer title —
+    /// giving system-style menu-bar tracking. `NSMenu` dismisses on click-outside natively.
+    fn open_menu_at(&self, first: usize) {
+        let mtm = self.mtm();
+        let mut idx = first;
+        loop {
+            // Build the native NSMenu for `idx` and grab its title button (for positioning).
+            let menu = NSMenu::new(mtm);
+            menu.setAutoenablesItems(false); // honor our explicit per-item enabled state
+            let target: &AnyObject = self;
+            let button = {
+                let inner = self.ivars().inner.borrow();
+                let Some(top) = inner.model.get(idx) else {
+                    return;
+                };
+                for (j, it) in top.items.iter().enumerate() {
+                    if it.is_sep {
+                        menu.addItem(&NSMenuItem::separatorItem(mtm));
+                        continue;
+                    }
+                    let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
+                    let item = unsafe {
+                        menu.addItemWithTitle_action_keyEquivalent(
+                            &NSString::from_str(&it.title),
+                            Some(sel!(itemClicked:)),
+                            &NSString::from_str(key),
+                        )
+                    };
+                    if let Some(s) = &it.shortcut {
+                        item.setKeyEquivalentModifierMask(s.mods);
+                    }
+                    item.setEnabled(it.enabled);
+                    item.setTag(j as isize);
+                    unsafe { item.setTarget(Some(target)) };
+                }
+                inner.buttons.get(idx).cloned()
+            };
+            let Some(button) = button else {
                 return;
             };
-            for (j, it) in top.items.iter().enumerate() {
-                if it.is_sep {
-                    menu.addItem(&NSMenuItem::separatorItem(mtm));
-                    continue;
-                }
-                let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
-                let item = unsafe {
-                    menu.addItemWithTitle_action_keyEquivalent(
-                        &NSString::from_str(&it.title),
-                        Some(sel!(itemClicked:)),
-                        &NSString::from_str(key),
-                    )
-                };
-                if let Some(s) = &it.shortcut {
-                    item.setKeyEquivalentModifierMask(s.mods);
-                }
-                item.setEnabled(it.enabled);
-                item.setTag(j as isize);
-                unsafe { item.setTarget(Some(target)) };
+
+            let (bar, bar_h, hl) = {
+                let mut inner = self.ivars().inner.borrow_mut();
+                inner.open_top = Some(idx);
+                inner.open_menu = Some(menu.clone());
+                inner.pending_switch = None;
+                (
+                    inner.bar.clone(),
+                    inner.bar_size.height,
+                    inner.highlight.clone(),
+                )
+            };
+
+            // Position under the title (below the bar's bottom edge) and show the highlight pill.
+            let btn = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
+            let bar_frame = bar.frame();
+            let loc = NSPoint::new(
+                btn.origin.x + MENU_LEFT_ADJUST,
+                bar_frame.origin.y - MENU_DROP,
+            );
+            if let Some(hl) = &hl {
+                let bf = button.frame();
+                hl.setFrame(NSRect::new(
+                    NSPoint::new(bf.origin.x - PILL_MARGIN, PILL_V_INSET),
+                    NSSize::new(bf.size.width + 2.0 * PILL_MARGIN, bar_h - 2.0 * PILL_V_INSET),
+                ));
+                hl.setHidden(false);
             }
-            inner.bar.clone()
-        };
-        self.ivars().inner.borrow_mut().open_top = Some(idx);
 
-        // Drop the menu from the bar's BOTTOM edge (not the button's, which is inset by the bar's
-        // vertical padding), aligned under the clicked title. Screen coords, item=nil => the menu's
-        // top-left lands at `loc` and it grows downward.
-        let btn = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
-        let bar_frame = bar.frame();
-        // MENU_DROP pushes the menu below the bar's bottom edge; MENU_LEFT_ADJUST lines the item
-        // text up under the title text.
-        let loc = NSPoint::new(
-            btn.origin.x + MENU_LEFT_ADJUST,
-            bar_frame.origin.y - MENU_DROP,
-        );
+            menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None); // blocks (modal)
 
-        // Show the highlight pill behind the active title while its menu is open (popUp blocks in
-        // a modal tracking loop, so we show it before and hide it after). The pill spans the full
-        // bar height with the bar's corner radius, plus horizontal margin around the text.
-        let (hl, bar_h) = {
-            let inner = self.ivars().inner.borrow();
-            (inner.highlight.clone(), inner.bar_size.height)
-        };
-        if let Some(hl) = &hl {
-            let bf = button.frame();
-            hl.setFrame(NSRect::new(
-                NSPoint::new(bf.origin.x - PILL_MARGIN, PILL_V_INSET),
-                NSSize::new(bf.size.width + 2.0 * PILL_MARGIN, bar_h - 2.0 * PILL_V_INSET),
-            ));
-            hl.setHidden(false);
+            if let Some(hl) = &hl {
+                hl.setHidden(true);
+            }
+            self.ivars().inner.borrow_mut().open_menu = None;
+
+            match self.ivars().inner.borrow_mut().pending_switch.take() {
+                Some(next) => idx = next, // hover moved to a peer title -> reopen it
+                None => break,            // dismissed or an item was selected
+            }
         }
-        menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
-        if let Some(hl) = &hl {
-            hl.setHidden(true);
+        self.ivars().inner.borrow_mut().open_top = None;
+    }
+
+    /// Fires in common run-loop modes (so it runs during the menu's modal tracking): if a menu is
+    /// open and the mouse is over a *different* top-level title, cancel the current menu so
+    /// `open_menu_at` reopens the peer's.
+    fn check_switch(&self) {
+        let loc = NSEvent::mouseLocation();
+        let (menu, target, cur) = {
+            let inner = self.ivars().inner.borrow();
+            let Some(menu) = inner.open_menu.clone() else {
+                return;
+            };
+            let mut target = None;
+            for (i, btn) in inner.buttons.iter().enumerate() {
+                let f = inner
+                    .bar
+                    .convertRectToScreen(btn.convertRect_toView(btn.bounds(), None));
+                if loc.x >= f.origin.x
+                    && loc.x <= f.origin.x + f.size.width
+                    && loc.y >= f.origin.y
+                    && loc.y <= f.origin.y + f.size.height
+                {
+                    target = Some(i);
+                    break;
+                }
+            }
+            (menu, target, inner.open_top)
+        };
+        if let Some(t) = target {
+            if Some(t) != cur {
+                self.ivars().inner.borrow_mut().pending_switch = Some(t);
+                menu.cancelTrackingWithoutAnimation();
+            }
         }
     }
 
