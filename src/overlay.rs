@@ -14,13 +14,16 @@ use core::ptr::NonNull;
 
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{
+    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+};
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSImage, NSLayoutAttribute,
-    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar, NSStatusItem,
-    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
-    NSWindowStyleMask, NSWorkspace,
+    NSBackingStoreType, NSButton, NSColor, NSEventModifierFlags, NSFont, NSFontAttributeName,
+    NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel,
+    NSScreen, NSStackView, NSStatusBar, NSStatusItem, NSUserInterfaceLayoutOrientation,
+    NSVariableStatusItemLength, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
+    NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSWorkspace,
 };
 use objc2_application_services::{AXError, AXObserver, AXUIElement};
 use objc2_core_foundation::{
@@ -28,7 +31,8 @@ use objc2_core_foundation::{
     CGSize,
 };
 use objc2_foundation::{
-    NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
+    NSAttributedString, NSDictionary, NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect,
+    NSSize, NSString, NSTimer,
 };
 
 use crate::ax::{self, names};
@@ -40,7 +44,8 @@ const SETTLE: Duration = Duration::from_millis(120); // how long the window must
 const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
 const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
 const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
-const FONT_SIZE: f64 = 15.0; // slightly larger than the default menu-bar font
+const FONT_SIZE: f64 = 13.0; // ~ the system menu-bar font size
+const MENU_LEFT_ADJUST: f64 = -13.0; // shift the dropdown left so its item text lines up under the title text
 const CORNER_RADIUS: f64 = 12.0; // matches the macOS window corner radius (rounds the bar's ends)
 const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
 // Nudge the popped menu down so its visual top clears the bar's bottom edge. NSMenu renders its
@@ -556,9 +561,25 @@ impl Controller {
         // top-left lands at `loc` and it grows downward.
         let btn = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
         let bar_frame = bar.frame();
-        // MENU_DROP pushes the menu below the bar's bottom edge (see the const).
-        let loc = NSPoint::new(btn.origin.x, bar_frame.origin.y - MENU_DROP);
+        // MENU_DROP pushes the menu below the bar's bottom edge; MENU_LEFT_ADJUST lines the item
+        // text up under the title text.
+        let loc = NSPoint::new(
+            btn.origin.x + MENU_LEFT_ADJUST,
+            bar_frame.origin.y - MENU_DROP,
+        );
+
+        // Highlight the active title with a rounded bubble while its menu is open (popUp blocks
+        // in a modal tracking loop, so we set the highlight before and clear it after).
+        button.setWantsLayer(true);
+        if let Some(layer) = button.layer() {
+            let cg = NSColor::unemphasizedSelectedContentBackgroundColor().CGColor();
+            layer.setBackgroundColor(Some(&cg));
+            layer.setCornerRadius(5.0);
+        }
         menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
+        if let Some(layer) = button.layer() {
+            layer.setBackgroundColor(None);
+        }
     }
 
     fn on_item_clicked(&self, j: usize) {
@@ -660,10 +681,34 @@ fn make_button(
     let btn =
         unsafe { NSButton::buttonWithTitle_target_action(&ns, Some(target), Some(action), mtm) };
     btn.setBordered(false);
-    btn.setFont(Some(font));
+    // Opaque black title (an attributed title overrides the vibrancy view's text blending, which
+    // otherwise greys the text out).
+    btn.setAttributedTitle(&black_title(title, font));
     btn.setEnabled(enabled);
     btn.setTag(tag);
     btn
+}
+
+/// An attributed string that renders `text` in opaque black at `font` (used for the bar titles so
+/// they don't get vibrancy-blended by the acrylic background).
+fn black_title(text: &str, font: &NSFont) -> Retained<NSAttributedString> {
+    let color = NSColor::colorWithWhite_alpha(0.0, 1.0); // opaque black
+    let color_obj: &AnyObject = &color;
+    let font_obj: &AnyObject = font;
+    let attrs = NSDictionary::from_slices(
+        &[
+            unsafe { NSForegroundColorAttributeName },
+            unsafe { NSFontAttributeName },
+        ],
+        &[color_obj, font_obj],
+    );
+    unsafe {
+        NSAttributedString::initWithString_attributes(
+            NSAttributedString::alloc(),
+            &NSString::from_str(text),
+            Some(&attrs),
+        )
+    }
 }
 
 /// The standard system menu-bar height.

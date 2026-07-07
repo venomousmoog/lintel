@@ -11,7 +11,14 @@ libc = "0.2"
 
 [dependencies.objc2-foundation]
 version = "0.3.2"
-features = ["NSString", "NSArray", "NSTimer", "NSDate", "NSGeometry", "objc2-core-foundation"]
+features = [
+    "NSString", "NSArray", "NSDictionary", "NSAttributedString", "NSTimer", "NSDate",
+    "NSGeometry", "objc2-core-foundation",
+]
+
+[dependencies.objc2-core-graphics]
+version = "0.3.2"
+features = ["CGColor"]
 
 [dependencies.objc2-app-kit]
 version = "0.3.2"
@@ -20,7 +27,8 @@ features = [
     "NSButton", "NSButtonCell", "NSStackView", "NSVisualEffectView", "NSScreen",
     "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSLayoutConstraint",
     "NSFont", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSImage",
-    "NSWorkspace", "NSRunningApplication", "objc2-core-foundation", "block2",
+    "NSAttributedString", "NSWorkspace", "NSRunningApplication",
+    "objc2-core-foundation", "objc2-core-graphics", "block2",
 ]
 
 [dependencies.objc2-core-foundation]
@@ -29,7 +37,7 @@ features = ["CFString", "CFArray", "CFDictionary", "CFRunLoop", "CFNumber", "CFC
 
 [dependencies.objc2-quartz-core]
 version = "0.3.2"
-features = ["CALayer", "objc2-core-foundation"]
+features = ["CALayer", "objc2-core-foundation", "objc2-core-graphics"]
 
 [dependencies.objc2-application-services]
 version = "0.3.2"
