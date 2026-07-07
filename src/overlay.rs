@@ -43,6 +43,7 @@ const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (verti
 const FONT_SIZE: f64 = 15.0; // slightly larger than the default menu-bar font
 const CORNER_RADIUS: f64 = 12.0; // matches the macOS window corner radius (rounds the bar's ends)
 const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
+const BAR_ALPHA: f64 = 0.9; // bar opacity (slightly translucent)
 
 // ---- menu model (elements cached for the current app) -------------------------------------
 
@@ -548,13 +549,13 @@ impl Controller {
         };
         self.ivars().inner.borrow_mut().open_top = Some(idx);
 
-        // Pop it up just under the clicked title (screen coords = the button's bottom-left).
-        let scr = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
-        menu.popUpMenuPositioningItem_atLocation_inView(
-            None,
-            NSPoint::new(scr.origin.x, scr.origin.y),
-            None,
-        );
+        // Drop the menu from the bar's BOTTOM edge (not the button's, which is inset by the bar's
+        // vertical padding), aligned under the clicked title. Screen coords, item=nil => the menu's
+        // top-left lands at `loc` and it grows downward.
+        let btn = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
+        let bar_frame = bar.frame();
+        let loc = NSPoint::new(btn.origin.x, bar_frame.origin.y);
+        menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
     }
 
     fn on_item_clicked(&self, j: usize) {
@@ -606,6 +607,7 @@ fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     panel.setLevel(level);
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&NSColor::clearColor()));
+    panel.setAlphaValue(BAR_ALPHA); // slightly translucent
     panel.setHasShadow(false); // no black outline; the rounded acrylic view is the whole visual
     panel.setCollectionBehavior(
         NSWindowCollectionBehavior::MoveToActiveSpace
