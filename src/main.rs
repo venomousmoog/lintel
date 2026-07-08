@@ -12,16 +12,18 @@
 //!   lintel watch                      run as an accessory app and log focus/geometry events
 
 mod ax;
+mod config;
 mod observer;
 mod overlay;
+mod settings;
 
 use objc2::MainThreadMarker;
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWorkspace};
 use objc2_application_services::AXError;
 
 use ax::{
-    app_element, attr_element, attr_string, children, is_trusted, names, press, prompt_trust,
-    set_timeout,
+    app_element, attr_element, attr_point, attr_size, attr_string, children, focused_window,
+    is_trusted, names, press, prompt_trust, set_timeout,
 };
 use observer::{AxObserver, ObserverCtx};
 
@@ -178,6 +180,94 @@ fn cmd_run() {
     drop(controller); // keep alive for the run loop's lifetime
 }
 
+/// Inspect why a window would (not) get a mirrored bar: prints the focused window's subrole,
+/// position/size, and the app's menu extent (`menus_right`) — for an app matched by name substring
+/// (case-insensitive), or the frontmost app if no filter is given. No focus stealing.
+fn cmd_diag(filter: Option<&str>) {
+    if !ensure_trust() {
+        std::process::exit(1);
+    }
+    let ws = NSWorkspace::sharedWorkspace();
+    let target: Option<(i32, String)> = if let Some(f) = filter {
+        let fl = f.to_lowercase();
+        let apps = ws.runningApplications();
+        let mut found = None;
+        for i in 0..apps.count() {
+            let a = apps.objectAtIndex(i);
+            let name = a.localizedName().map(|s| s.to_string()).unwrap_or_default();
+            if name.to_lowercase().contains(&fl) {
+                found = Some((a.processIdentifier(), name));
+                break;
+            }
+        }
+        found
+    } else {
+        frontmost()
+    };
+    let Some((pid, name)) = target else {
+        eprintln!("no matching running app");
+        return;
+    };
+    println!("App: {name} (pid {pid})");
+    let app = app_element(pid);
+    set_timeout(&app, 2.0);
+
+    match focused_window(&app) {
+        Some(win) => {
+            let subrole = attr_string(&win, names::AX_SUBROLE);
+            let pos = attr_point(&win, names::AX_POSITION);
+            let size = attr_size(&win, names::AX_SIZE);
+            let (px, py) = pos.map_or((f64::NAN, f64::NAN), |p| (p.x, p.y));
+            let (sw, sh) = size.map_or((f64::NAN, f64::NAN), |s| (s.width, s.height));
+            println!("focused window: subrole={subrole:?}");
+            println!("  pos=({px:.0},{py:.0})  size=({sw:.0}x{sh:.0})");
+        }
+        None => println!("focused window: <none>"),
+    }
+
+    if let Some(menubar) = attr_element(&app, names::AX_MENU_BAR) {
+        let mut menu_left = f64::INFINITY;
+        let mut menu_right = f64::NEG_INFINITY;
+        for top in children(&menubar) {
+            let t = attr_string(&top, names::AX_TITLE).unwrap_or_default();
+            match (
+                attr_point(&top, names::AX_POSITION),
+                attr_size(&top, names::AX_SIZE),
+            ) {
+                (Some(p), Some(s)) => {
+                    menu_left = menu_left.min(p.x);
+                    menu_right = menu_right.max(p.x + s.width);
+                    println!("  menu {t:?}: x={:.0} w={:.0} right={:.0}", p.x, s.width, p.x + s.width);
+                }
+                _ => println!("  menu {t:?}: (no geometry)"),
+            }
+        }
+        println!("menu span: left={menu_left:.0} right={menu_right:.0} length={:.0}", menu_right - menu_left);
+    } else {
+        println!("no AXMenuBar");
+    }
+
+    if let Some(mtm) = MainThreadMarker::new() {
+        if let Some(scr) = objc2_app_kit::NSScreen::mainScreen(mtm) {
+            let f = scr.frame();
+            let v = scr.visibleFrame();
+            println!(
+                "mainScreen: frame=({:.0},{:.0} {:.0}x{:.0}) visible=({:.0},{:.0} {:.0}x{:.0})",
+                f.origin.x, f.origin.y, f.size.width, f.size.height,
+                v.origin.x, v.origin.y, v.size.width, v.size.height
+            );
+        }
+        let screens = objc2_app_kit::NSScreen::screens(mtm);
+        for i in 0..screens.count() {
+            let fr = screens.objectAtIndex(i).frame();
+            println!(
+                "  screen[{i}]: ({:.0},{:.0} {:.0}x{:.0})",
+                fr.origin.x, fr.origin.y, fr.size.width, fr.size.height
+            );
+        }
+    }
+}
+
 fn cmd_watch() {
     if !ensure_trust() {
         std::process::exit(1);
@@ -209,7 +299,10 @@ fn main() {
             _ => eprintln!("usage: lintel press \"<TopMenu>\" \"<Item>\""),
         },
         Some("read") => cmd_read(),
+        Some("diag") => cmd_diag(args.get(2).map(String::as_str)),
         None => cmd_run(), // default (incl. when launched as a .app bundle)
-        Some(other) => eprintln!("unknown command '{other}' (try: run | read | press | watch)"),
+        Some(other) => {
+            eprintln!("unknown command '{other}' (try: run | read | press | watch | diag [app])")
+        }
     }
 }

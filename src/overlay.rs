@@ -12,16 +12,17 @@ use std::cell::RefCell;
 use std::time::{Duration, Instant};
 use core::ptr::NonNull;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2::{
-    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
+    define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSBackingStoreType, NSButton, NSColor, NSEvent, NSEventModifierFlags, NSFont,
-    NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSLayoutAttribute, NSMenu,
-    NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar, NSStatusItem,
-    NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView,
+    NSAnimatablePropertyContainer, NSAnimationContext, NSBackingStoreType, NSButton, NSColor,
+    NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
+    NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar,
+    NSStatusItem, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
@@ -34,13 +35,19 @@ use objc2_foundation::{
     NSAttributedString, NSDictionary, NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect,
     NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
+use objc2_quartz_core::{kCAMediaTimingFunctionLinear, CAMediaTimingFunction};
 
 use crate::ax::{self, names};
+use crate::config::{self, Config};
 
 const BAR_H: f64 = 24.0; // fallback; the real bar height tracks the system menu bar (§ menu_bar_height)
 const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (design v2 §6.3)
-const TICK_INTERVAL: f64 = 1.0 / 60.0; // window-follow poll rate (~60 Hz; was 10 Hz)
-const SETTLE: Duration = Duration::from_millis(120); // how long the window must be still before re-showing
+// Window-follow poll rate, settle delay, and fade duration are user-configurable — see
+// `crate::config::Config` (poll_hz / settle_ms / fade_ms). The running Controller holds a
+// live `Config` and reads these at each use-site so the settings pane can change them.
+const MENU_RECHECK: Duration = Duration::from_millis(500); // re-read the current app's menus this often
+const STANDARD_WINDOW_SUBROLE: &str = "AXStandardWindow"; // only mirror the menu above real windows
+const MENU_HIDE_FACTOR: f64 = 1.5; // hide when within this multiple of the menu's length of its start
 const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
 const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
 const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
@@ -131,6 +138,24 @@ unsafe extern "C-unwind" fn ax_move_cb(
     }));
 }
 
+/// Cheap read of just the top-level menu titles (no descent into items), for change detection —
+/// mirrors the filtering in `rebuild_bar_content` (drop the empty + Apple entries).
+fn read_top_titles(app: &AXUIElement) -> Vec<String> {
+    let mut titles = Vec::new();
+    if let Some(menubar) = ax::attr_element(app, names::AX_MENU_BAR) {
+        for top in ax::children(&menubar) {
+            let Some(title) = ax::attr_string(&top, names::AX_TITLE) else {
+                continue;
+            };
+            if title.is_empty() || title == "Apple" {
+                continue;
+            }
+            titles.push(title);
+        }
+    }
+    titles
+}
+
 fn same_element(a: &AXUIElement, b: &AXUIElement) -> bool {
     CFEqual(Some(&**a), Some(&**b))
 }
@@ -158,7 +183,13 @@ struct Inner {
     buttons: Vec<Retained<NSButton>>,      // the top-level title buttons (for hover hit-testing)
     open_menu: Option<Retained<NSMenu>>,   // the currently-tracking dropdown (to cancel on switch)
     pending_switch: Option<usize>,         // peer title to open after cancelling the current one
-    menus_right_edge: f64,                  // AX x where the real system menus end (Apple + app menus)
+    menu_left: f64,                         // AX x of the real menus' left edge (Apple menu); per-display
+    menu_right: f64,                        // AX x of the real menus' right edge (last app menu)
+    fade_gen: u64,                          // bumped on every show/hide so stale fade completions no-op
+    current_window: Option<CFRetained<AXUIElement>>, // focused window identity (detects window switches)
+    config: Config,                         // live user settings (timings); edited via the settings pane
+    tick_timer: Option<Retained<NSTimer>>,  // the reconciliation timer (recreated when poll rate changes)
+    last_menu_check: Option<Instant>,       // last periodic menu re-read (picks up late-populating menus)
 }
 
 pub struct Ivars {
@@ -199,6 +230,11 @@ define_class!(
             self.check_switch();
         }
 
+        #[unsafe(method(openSettings:))]
+        fn open_settings_(&self, _sender: Option<&AnyObject>) {
+            self.open_settings();
+        }
+
         #[unsafe(method(quitLintel:))]
         fn quit_(&self, _sender: Option<&AnyObject>) {
             std::process::exit(0);
@@ -225,7 +261,13 @@ impl Controller {
             buttons: Vec::new(),
             open_menu: None,
             pending_switch: None,
-            menus_right_edge: 0.0,
+            menu_left: f64::INFINITY,
+            menu_right: f64::NEG_INFINITY,
+            fade_gen: 0,
+            current_window: None,
+            config: config::load(),
+            tick_timer: None,
+            last_menu_check: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -236,15 +278,10 @@ impl Controller {
     /// Install the menu-bar status item and start the timers.
     pub fn start(&self) {
         self.setup_status_item();
+        // Window-follow reconciliation (default mode; paused while a menu tracks). Stored so a
+        // poll-rate change from the settings pane can recreate it at the new interval.
+        self.restart_tick_timer();
         unsafe {
-            // Window-follow reconciliation (default mode; paused while a menu tracks).
-            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                TICK_INTERVAL,
-                self,
-                sel!(tick:),
-                None,
-                true,
-            );
             // Hover switch-watcher, in COMMON modes so it also fires during the menu's modal
             // tracking loop — lets us switch menus when the mouse moves to a peer title.
             let watcher = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
@@ -256,6 +293,60 @@ impl Controller {
             );
             NSRunLoop::currentRunLoop().addTimer_forMode(&watcher, NSRunLoopCommonModes);
         }
+    }
+
+    /// (Re)create the reconciliation timer at the configured poll rate, invalidating any prior one.
+    fn restart_tick_timer(&self) {
+        let interval = self.ivars().inner.borrow().config.tick_interval();
+        if let Some(old) = self.ivars().inner.borrow_mut().tick_timer.take() {
+            old.invalidate();
+        }
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                interval,
+                self,
+                sel!(tick:),
+                None,
+                true,
+            )
+        };
+        self.ivars().inner.borrow_mut().tick_timer = Some(timer);
+    }
+
+    /// Snapshot the live config (for the settings pane's `read` closure).
+    fn current_config(&self) -> Config {
+        self.ivars().inner.borrow().config.clone()
+    }
+
+    /// Adopt a config edited in the settings pane: store it, live-apply (restart the timer if the
+    /// poll rate changed, (un)register the login item if that flipped), and persist to disk.
+    fn apply_and_save_config(&self, cfg: Config) {
+        let cfg = cfg.sanitized();
+        let (poll_changed, login_changed) = {
+            let inner = self.ivars().inner.borrow();
+            (
+                inner.config.poll_hz != cfg.poll_hz,
+                inner.config.launch_at_login != cfg.launch_at_login,
+            )
+        };
+        self.ivars().inner.borrow_mut().config = cfg.clone();
+        if poll_changed {
+            self.restart_tick_timer();
+        }
+        if login_changed {
+            crate::settings::set_login_item(cfg.launch_at_login);
+        }
+        config::save(&cfg);
+    }
+
+    /// Open the settings window, wiring its read/write closures back to this controller.
+    fn open_settings(&self) {
+        let r = self.retain();
+        let read: std::rc::Rc<dyn Fn() -> Config> = std::rc::Rc::new(move || r.current_config());
+        let w = self.retain();
+        let write: std::rc::Rc<dyn Fn(Config)> =
+            std::rc::Rc::new(move |cfg| w.apply_and_save_config(cfg));
+        crate::settings::open(self.mtm(), read, write);
     }
 
     /// A menu-bar status item (icon + "Quit Lintel"), so Lintel can run in the background
@@ -279,6 +370,13 @@ impl Controller {
         let menu = NSMenu::new(mtm);
         let target: &AnyObject = self;
         unsafe {
+            let settings = menu.addItemWithTitle_action_keyEquivalent(
+                &NSString::from_str("Settings…"),
+                Some(sel!(openSettings:)),
+                &NSString::from_str(","),
+            );
+            settings.setTarget(Some(target));
+            menu.addItem(&NSMenuItem::separatorItem(mtm));
             let quit = menu.addItemWithTitle_action_keyEquivalent(
                 &NSString::from_str("Quit Lintel"),
                 Some(sel!(quitLintel:)),
@@ -303,8 +401,10 @@ impl Controller {
             return; // never mirror ourselves
         }
 
+        // App focus change: kill the old app's bar instantly and build the new app's bar; reconcile
+        // then fades the new bar in.
         if self.ivars().inner.borrow().current_pid != pid {
-            self.rebuild_bar_content(pid);
+            self.begin_refocus(pid);
         }
 
         let app = ax::app_element(pid);
@@ -313,10 +413,121 @@ impl Controller {
             self.hide_all();
             return;
         };
+
+        // The focused window is a transient sub-window (popover / sheet / dialog / floating panel)
+        // if its subrole isn't AXStandardWindow. We don't reposition the bar onto those — a menu
+        // bar doesn't belong above a popover. But if we're already showing THIS app's bar, we keep
+        // it in place above its parent window (like macOS keeps the real menu bar active while a
+        // popover/sheet is open — e.g. Chrome's tab-search popover keeps the Chrome menu up).
+        // Otherwise (a different app's transient, e.g. a TCC prompt owned by UserNotificationCenter,
+        // or nothing showing) we hide. Checked before the refocus logic so a transient never drags
+        // the bar off its parent window.
+        let subrole = ax::attr_string(&win, names::AX_SUBROLE);
+        if subrole.as_deref() != Some(STANDARD_WINDOW_SUBROLE) {
+            let keep = {
+                let inner = self.ivars().inner.borrow();
+                inner.shown && inner.current_pid == pid
+            };
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!(
+                    "[dbg] transient focused window (subrole={subrole:?}) -> {}",
+                    if keep { "keep bar in place" } else { "hide" }
+                );
+            }
+            if !keep {
+                self.hide_all();
+            }
+            return;
+        }
+
+        // Focus moved to a different window of the SAME app (a genuine focus change, not a move of
+        // the same window): kill + refocus onto it too. `begin_refocus` clears `current_window`, so
+        // this fires once; the block below re-establishes the new window's identity.
+        let win_changed = {
+            let inner = self.ivars().inner.borrow();
+            inner
+                .current_window
+                .as_deref()
+                .is_some_and(|w| !same_element(w, &win))
+        };
+        if win_changed {
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!("[dbg] window focus changed -> refocus");
+            }
+            self.begin_refocus(pid);
+        }
+        // Remember the focused window (only when unset) so the next tick can detect a switch away
+        // from it; once set it stays until a refocus clears it (avoids a retain/release each tick).
+        {
+            let mut inner = self.ivars().inner.borrow_mut();
+            if inner.current_window.is_none() {
+                inner.current_window = Some(win.clone());
+            }
+        }
+
+        // Periodically re-read the menus so a menu bar that populates AFTER focus (Electron / lazy
+        // apps that had no menu at focus time) gets picked up without a manual refocus. Cheap: only
+        // compares top-level titles; a full rebuild happens only when they actually change.
+        self.recheck_menus(&app, pid);
+
         // Arm/refresh the event-driven move observer on the current window (re-arm only here,
         // never inside the callback), then position (this is also the 60 Hz fallback).
         self.ensure_observer(pid, &win);
         self.reconcile(&win);
+    }
+
+    /// Low-frequency menu refresh: every `MENU_RECHECK`, compare the live top-level menu titles to
+    /// the ones we're showing and rebuild if they differ. Skipped while a dropdown is open. Never
+    /// wipes to empty on a transient read failure (only rebuilds when the new titles are non-empty).
+    fn recheck_menus(&self, app: &AXUIElement, pid: i32) {
+        let now = Instant::now();
+        let due = {
+            let inner = self.ivars().inner.borrow();
+            inner.open_top.is_none()
+                && inner
+                    .last_menu_check
+                    .map_or(true, |t| now >= t + MENU_RECHECK)
+        };
+        if !due {
+            return;
+        }
+        self.ivars().inner.borrow_mut().last_menu_check = Some(now);
+        let titles = read_top_titles(app);
+        if titles.is_empty() {
+            return; // treat a menu-less read as transient; don't blank an existing bar
+        }
+        let changed = {
+            let inner = self.ivars().inner.borrow();
+            titles.len() != inner.model.len()
+                || titles.iter().zip(inner.model.iter()).any(|(t, m)| *t != m.title)
+        };
+        if changed {
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!("[dbg] menu titles changed -> rebuild");
+            }
+            self.rebuild_bar_content(pid);
+        }
+    }
+
+    /// Handle a focus change: kill the current bar instantly (no fade-out) and build the new app's
+    /// bar. `reconcile` then fades the new bar in. `current_window` is cleared so the caller
+    /// re-establishes the newly focused window's identity.
+    fn begin_refocus(&self, pid: i32) {
+        let bar = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.current_window = None;
+            inner.shown.then(|| {
+                inner.shown = false;
+                inner.bar.clone()
+            })
+        };
+        if let Some(bar) = bar {
+            if std::env::var_os("LINTEL_DEBUG").is_some() {
+                eprintln!("[dbg] begin_refocus -> kill + rebuild (pid {pid})");
+            }
+            self.hide_fast(bar); // drop the old app's bar instantly
+        }
+        self.rebuild_bar_content(pid); // build the new app's bar; reconcile fades it in
     }
 
     /// AXObserver callback: the focused window just started moving/resizing. Hide the bar at once
@@ -326,7 +537,7 @@ impl Controller {
         let bar = {
             let mut inner = self.ivars().inner.borrow_mut();
             inner.moving = true;
-            inner.settle_at = Some(now + SETTLE);
+            inner.settle_at = Some(now + Duration::from_millis(inner.config.settle_ms as u64));
             inner.shown.then(|| {
                 inner.shown = false;
                 inner.bar.clone()
@@ -336,7 +547,7 @@ impl Controller {
             if std::env::var_os("LINTEL_DEBUG").is_some() {
                 eprintln!("[dbg] begin_move -> hide");
             }
-            bar.orderOut(None);
+            self.hide_fast(bar); // pop out fast during a move; re-pin (fade) once settled
         }
     }
 
@@ -355,21 +566,25 @@ impl Controller {
             self.hide_all();
             return;
         }
-        // Hide only when the bar would overlap the actual system MENUS (top-left): vertically
-        // within the menu-bar strip AND horizontally within the app menus' extent. A window near
-        // the top but off to the side (bar over empty menu-bar space) still shows and overlaps.
-        // `pos` is AX top-left (0,0 = top-left of the primary display).
-        let (bar_h, menus_right) = {
+        // Hide only when the bar would sit near the actual system MENUS: vertically within the
+        // menu-bar strip AND horizontally within MENU_HIDE_FACTOR x the menus' length of where they
+        // start. A window off to the side (bar over empty menu-bar space) still shows and overlaps.
+        // Menu coords are per-display and go NEGATIVE on non-primary monitors, so we use the real
+        // menu span (min..max, never seeded at 0) — a window far to the right of the menus on a
+        // left-hand display (negative x) must not be treated as covering them.
+        let (bar_h, menu_left, menu_right) = {
             let inner = self.ivars().inner.borrow();
-            (inner.bar_size.height, inner.menus_right_edge)
+            (inner.bar_size.height, inner.menu_left, inner.menu_right)
         };
         let in_strip = pos.y < menu_bar_height() + WINDOW_GAP + bar_h;
-        let over_menus = pos.x < menus_right;
+        let has_menus = menu_right >= menu_left; // false until we've read menu geometry
+        let hide_x = menu_left + MENU_HIDE_FACTOR * (menu_right - menu_left);
+        let over_menus = has_menus && pos.x < hide_x;
         if in_strip && over_menus {
             if std::env::var_os("LINTEL_DEBUG").is_some() {
                 eprintln!(
-                    "[dbg] hide: bar over system menus (winpos=({:.0},{:.0}), menus_right={:.0})",
-                    pos.x, pos.y, menus_right
+                    "[dbg] hide: near system menus (winx={:.0} hide_x={:.0} span=[{:.0},{:.0}])",
+                    pos.x, hide_x, menu_left, menu_right
                 );
             }
             self.hide_all();
@@ -391,7 +606,7 @@ impl Controller {
                 } else {
                     // Window moved/resized: hide and wait for it to settle.
                     inner.moving = true;
-                    inner.settle_at = Some(now + SETTLE);
+                    inner.settle_at = Some(now + Duration::from_millis(inner.config.settle_ms as u64));
                     if inner.shown {
                         inner.shown = false;
                         Action::Hide(inner.bar.clone())
@@ -422,13 +637,13 @@ impl Controller {
                     eprintln!("[dbg] show winpos=({:.0},{:.0}) baro=({x:.0},{y_top:.0})", pos.x, pos.y);
                 }
                 bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
-                bar.orderFront(None);
+                self.show_animated(bar); // fresh focus / settle re-pin -> fade in
             }
             Action::Hide(bar) => {
                 if debug {
                     eprintln!("[dbg] hide (moving)");
                 }
-                bar.orderOut(None);
+                self.hide_fast(bar); // window is moving -> pop out fast
             }
             Action::Nothing => {}
         }
@@ -490,16 +705,19 @@ impl Controller {
         ax::set_timeout(&app, 1.0);
 
         let mut model = Vec::new();
-        let mut menus_right = 0.0_f64; // right edge of the real system menus (Apple + app menus)
+        // Real system menus' horizontal span (include the Apple menu). Seeded to an empty range so
+        // negative per-display coordinates aren't clamped to 0 (a left-hand monitor reports menus at
+        // negative x); left as empty if no item exposes geometry.
+        let mut menu_left = f64::INFINITY;
+        let mut menu_right = f64::NEG_INFINITY;
         if let Some(menubar) = ax::attr_element(&app, names::AX_MENU_BAR) {
             for top in ax::children(&menubar) {
-                // Track the real menus' horizontal extent (include the Apple menu) so we only hide
-                // when the bar would actually cover them, not just for being near the top.
                 if let (Some(p), Some(s)) = (
                     ax::attr_point(&top, names::AX_POSITION),
                     ax::attr_size(&top, names::AX_SIZE),
                 ) {
-                    menus_right = menus_right.max(p.x + s.width);
+                    menu_left = menu_left.min(p.x);
+                    menu_right = menu_right.max(p.x + s.width);
                 }
                 let Some(title) = ax::attr_string(&top, names::AX_TITLE) else {
                     continue;
@@ -572,7 +790,8 @@ impl Controller {
             inner.last_frame = None; // bar size changed; reposition on the next tick
             inner.highlight = Some(highlight);
             inner.buttons = buttons;
-            inner.menus_right_edge = menus_right;
+            inner.menu_left = menu_left;
+            inner.menu_right = menu_right;
             inner.bar.clone()
         };
         bar.setContentView(Some(&effect));
@@ -728,16 +947,78 @@ impl Controller {
     fn hide_all(&self) {
         let bar = {
             let mut inner = self.ivars().inner.borrow_mut();
+            let was_shown = inner.shown;
             inner.last_frame = None; // force a fresh show when an eligible window returns
             inner.moving = false;
             inner.shown = false;
-            inner.bar.clone()
+            was_shown.then(|| inner.bar.clone())
         };
+        if let Some(bar) = bar {
+            self.hide_animated(bar); // non-move hide (fullscreen/maximized/over-menus/no-window) -> fade out
+        }
+    }
+
+    /// Fade the bar in over FADE seconds (used for non-move shows: settle + fresh focus).
+    fn show_animated(&self, bar: Retained<NSPanel>) {
+        self.ivars().inner.borrow_mut().fade_gen += 1;
+        // Only reset to 0 when the bar is off-screen. If it's still visible (a non-move fade-out
+        // was interrupted mid-fade), fade up from its current alpha so it doesn't blink to 0 first.
+        if !bar.isVisible() {
+            bar.setAlphaValue(0.0);
+        }
+        bar.orderFront(None);
+        let fade = self.ivars().inner.borrow().config.fade_secs();
+        let b = bar.clone();
+        let changes = RcBlock::new(move |ctx: NonNull<NSAnimationContext>| {
+            let ctx = unsafe { ctx.as_ref() };
+            ctx.setDuration(fade);
+            ctx.setTimingFunction(Some(&linear_timing()));
+            b.animator().setAlphaValue(1.0);
+        });
+        NSAnimationContext::runAnimationGroup(&changes);
+    }
+
+    /// Hide the bar immediately (used during a window move — pop out fast, no fade, no chase).
+    fn hide_fast(&self, bar: Retained<NSPanel>) {
+        self.ivars().inner.borrow_mut().fade_gen += 1;
         bar.orderOut(None);
+        bar.setAlphaValue(1.0);
+    }
+
+    /// Fade the bar out over FADE seconds, then order it out. A generation guard stops a stale
+    /// completion from hiding a bar that was shown again during the fade.
+    fn hide_animated(&self, bar: Retained<NSPanel>) {
+        let my_gen = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.fade_gen += 1;
+            inner.fade_gen
+        };
+        let fade = self.ivars().inner.borrow().config.fade_secs();
+        let b = bar.clone();
+        let changes = RcBlock::new(move |ctx: NonNull<NSAnimationContext>| {
+            let ctx = unsafe { ctx.as_ref() };
+            ctx.setDuration(fade);
+            ctx.setTimingFunction(Some(&linear_timing()));
+            b.animator().setAlphaValue(0.0);
+        });
+        let this = self.retain();
+        let done = RcBlock::new(move || {
+            if this.ivars().inner.borrow().fade_gen == my_gen {
+                bar.orderOut(None);
+                bar.setAlphaValue(1.0);
+            }
+        });
+        NSAnimationContext::runAnimationGroup_completionHandler(&changes, Some(&done));
     }
 }
 
 // ---- free helpers -------------------------------------------------------------------------
+
+/// A linear timing curve so fades progress at a constant rate (the default ease-in-ease-out
+/// spends the start/end near-stationary, which reads as a delay on long durations).
+fn linear_timing() -> Retained<CAMediaTimingFunction> {
+    unsafe { CAMediaTimingFunction::functionWithName(kCAMediaTimingFunctionLinear) }
+}
 
 fn make_panel(mtm: MainThreadMarker, level: isize) -> Retained<NSPanel> {
     let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, BAR_H));

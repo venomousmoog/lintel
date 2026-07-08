@@ -8,6 +8,12 @@ description = "Local floating menu bar for macOS windows"
 objc2 = "0.6.4"
 block2 = "0.6.2"
 libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[dependencies.objc2-service-management]
+version = "0.3.2"
+features = ["SMAppService"]
 
 [dependencies.objc2-foundation]
 version = "0.3.2"
@@ -26,9 +32,11 @@ features = [
     "NSApplication", "NSResponder", "NSWindow", "NSPanel", "NSView", "NSControl",
     "NSButton", "NSButtonCell", "NSStackView", "NSVisualEffectView", "NSScreen",
     "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSLayoutConstraint",
+    "NSLayoutAnchor",
     "NSFont", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSImage",
-    "NSAttributedString", "NSWorkspace", "NSRunningApplication",
-    "objc2-core-foundation", "objc2-core-graphics", "block2",
+    "NSAttributedString", "NSAnimation", "NSAnimationContext", "NSWorkspace",
+    "NSRunningApplication", "NSTabView", "NSTabViewItem", "NSSlider", "NSTextField",
+    "objc2-core-foundation", "objc2-core-graphics", "objc2-quartz-core", "block2",
 ]
 
 [dependencies.objc2-core-foundation]
@@ -37,7 +45,7 @@ features = ["CFString", "CFArray", "CFDictionary", "CFRunLoop", "CFNumber", "CFC
 
 [dependencies.objc2-quartz-core]
 version = "0.3.2"
-features = ["CALayer", "objc2-core-foundation", "objc2-core-graphics"]
+features = ["CALayer", "CAMediaTimingFunction", "objc2-core-foundation", "objc2-core-graphics"]
 
 [dependencies.objc2-application-services]
 version = "0.3.2"
