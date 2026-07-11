@@ -562,7 +562,7 @@ impl Controller {
             self.hide_all();
             return;
         };
-        if should_hide(self.mtm(), size) {
+        if should_hide(self.mtm(), pos, size) {
             self.hide_all();
             return;
         }
@@ -572,19 +572,26 @@ impl Controller {
         // Menu coords are per-display and go NEGATIVE on non-primary monitors, so we use the real
         // menu span (min..max, never seeded at 0) — a window far to the right of the menus on a
         // left-hand display (negative x) must not be treated as covering them.
-        let (bar_h, menu_left, menu_right) = {
+        let (bar_size, menu_left, menu_right) = {
             let inner = self.ivars().inner.borrow();
-            (inner.bar_size.height, inner.menu_left, inner.menu_right)
+            (inner.bar_size, inner.menu_left, inner.menu_right)
         };
+        let bar_h = bar_size.height;
         let in_strip = pos.y < menu_bar_height() + WINDOW_GAP + bar_h;
         let has_menus = menu_right >= menu_left; // false until we've read menu geometry
         let hide_x = menu_left + MENU_HIDE_FACTOR * (menu_right - menu_left);
         let over_menus = has_menus && pos.x < hide_x;
-        if in_strip && over_menus {
+        // Camera-notch: while up in the top strip, hide if the bar's x-span would slide under the
+        // notch of the window's display (it would occlude the middle of the menu). x is shared by AX
+        // and Cocoa, so we compare directly.
+        let over_notch = notch_x_span(self.mtm(), pos.x + size.width / 2.0)
+            .is_some_and(|(nl, nr)| pos.x < nr && pos.x + bar_size.width > nl);
+        if in_strip && (over_menus || over_notch) {
             if std::env::var_os("LINTEL_DEBUG").is_some() {
                 eprintln!(
-                    "[dbg] hide: near system menus (winx={:.0} hide_x={:.0} span=[{:.0},{:.0}])",
-                    pos.x, hide_x, menu_left, menu_right
+                    "[dbg] hide: {} (winx={:.0} barw={:.0} hide_x={:.0} span=[{:.0},{:.0}])",
+                    if over_notch { "under notch" } else { "near system menus" },
+                    pos.x, bar_size.width, hide_x, menu_left, menu_right
                 );
             }
             self.hide_all();
@@ -1138,6 +1145,28 @@ fn menu_bar_height() -> f64 {
     NSStatusBar::systemStatusBar().thickness()
 }
 
+/// The horizontal span `[left, right]` of the camera notch on the screen containing `probe_x`
+/// (AX and Cocoa x-coordinates are equal), or `None` if that screen has no notch. The notch is the
+/// gap between the two top auxiliary areas; `safeAreaInsets().top > 0` marks a notched display.
+fn notch_x_span(mtm: MainThreadMarker, probe_x: f64) -> Option<(f64, f64)> {
+    let screens = NSScreen::screens(mtm);
+    for i in 0..screens.count() {
+        let s = screens.objectAtIndex(i);
+        let fr = s.frame();
+        if probe_x >= fr.origin.x && probe_x < fr.origin.x + fr.size.width {
+            if s.safeAreaInsets().top <= 0.0 {
+                return None; // this screen has no notch
+            }
+            let al = s.auxiliaryTopLeftArea();
+            let ar = s.auxiliaryTopRightArea();
+            let left = al.origin.x + al.size.width;
+            let right = ar.origin.x;
+            return (right > left).then_some((left, right));
+        }
+    }
+    None
+}
+
 /// The system menu-bar font, in regular and bold (bold is used for the app menu, like macOS).
 fn menu_bar_fonts(mtm: MainThreadMarker) -> (Retained<NSFont>, Retained<NSFont>) {
     let _ = mtm;
@@ -1160,16 +1189,21 @@ fn origin_screen_height(mtm: MainThreadMarker) -> f64 {
     }
 }
 
-/// Hide when the focused window is (near-)fullscreen or maximized (design v2 §5.4, MVP heuristic).
-fn should_hide(mtm: MainThreadMarker, size: CGSize) -> bool {
+/// Hide when the focused window is (near-)fullscreen or maximized AND is actually covering the top
+/// of the screen (design v2 §5.4, MVP heuristic). A maximized-SIZE window dragged down from the top
+/// leaves room above it for the bar, so we only hide while its top edge is up in the menu-bar row.
+fn should_hide(mtm: MainThreadMarker, pos: CGPoint, size: CGSize) -> bool {
     let Some(screen) = NSScreen::mainScreen(mtm) else {
         return false;
     };
     let frame = screen.frame();
     let visible = screen.visibleFrame();
+    // `pos` is AX top-left (y down). A window filling the visible area sits just below the menu bar;
+    // a fullscreen window covers it. Once dragged down, pos.y grows past this and we stop hiding.
+    let at_top = pos.y <= menu_bar_height() + 6.0;
     // Fullscreen: window ~= whole display. Maximized: window ~= usable (visible) area.
     let fullscreen = size.height >= frame.size.height - 2.0;
     let maximized =
         size.height >= visible.size.height - 2.0 && size.width >= visible.size.width - 2.0;
-    fullscreen || maximized
+    at_top && (fullscreen || maximized)
 }

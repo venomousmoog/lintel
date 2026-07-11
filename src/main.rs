@@ -259,11 +259,24 @@ fn cmd_diag(filter: Option<&str>) {
         }
         let screens = objc2_app_kit::NSScreen::screens(mtm);
         for i in 0..screens.count() {
-            let fr = screens.objectAtIndex(i).frame();
+            let s = screens.objectAtIndex(i);
+            let fr = s.frame();
+            let ins = s.safeAreaInsets();
+            let al = s.auxiliaryTopLeftArea();
+            let ar = s.auxiliaryTopRightArea();
             println!(
-                "  screen[{i}]: ({:.0},{:.0} {:.0}x{:.0})",
-                fr.origin.x, fr.origin.y, fr.size.width, fr.size.height
+                "  screen[{i}]: frame=({:.0},{:.0} {:.0}x{:.0}) safeTop={:.0}",
+                fr.origin.x, fr.origin.y, fr.size.width, fr.size.height, ins.top
             );
+            if ins.top > 0.0 {
+                // Notch spans the gap between the two top auxiliary areas (Cocoa coords, y bottom-up).
+                let notch_l = al.origin.x + al.size.width;
+                let notch_r = ar.origin.x;
+                println!(
+                    "            notch: x=[{:.0},{:.0}] (w={:.0})  auxL={:.0}w  auxR@{:.0}",
+                    notch_l, notch_r, notch_r - notch_l, al.size.width, ar.origin.x
+                );
+            }
         }
     }
 }
