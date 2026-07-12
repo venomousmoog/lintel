@@ -317,6 +317,7 @@ impl Controller {
             NSRunLoop::currentRunLoop().addTimer_forMode(&watcher, NSRunLoopCommonModes);
         }
         self.register_hotkey();
+        crate::settings::apply_theme(self.mtm(), self.ivars().inner.borrow().config.theme);
     }
 
     /// Register the global command-palette hotkey from config (RAII guard kept in `inner.hotkey`).
@@ -327,7 +328,7 @@ impl Controller {
             this.on_palette_hotkey()
         }) {
             Ok(reg) => self.ivars().inner.borrow_mut().hotkey = Some(reg),
-            Err(e) => eprintln!("[lintel] command-palette hotkey registration failed: {e}"),
+            Err(e) => tracing::error!("command-palette hotkey registration failed: {e}"),
         }
     }
 
@@ -340,6 +341,7 @@ impl Controller {
         if pid == std::process::id() as i32 {
             return; // never target ourselves
         }
+        tracing::debug!("palette hotkey fired, frontmost pid={pid}");
         crate::palette::open(self.mtm(), pid);
     }
 
@@ -370,11 +372,12 @@ impl Controller {
     /// poll rate changed, (un)register the login item if that flipped), and persist to disk.
     fn apply_and_save_config(&self, cfg: Config) {
         let cfg = cfg.sanitized();
-        let (poll_changed, login_changed) = {
+        let (poll_changed, login_changed, theme_changed) = {
             let inner = self.ivars().inner.borrow();
             (
                 inner.config.poll_hz != cfg.poll_hz,
                 inner.config.launch_at_login != cfg.launch_at_login,
+                inner.config.theme != cfg.theme,
             )
         };
         self.ivars().inner.borrow_mut().config = cfg.clone();
@@ -383,6 +386,9 @@ impl Controller {
         }
         if login_changed {
             crate::settings::set_login_item(cfg.launch_at_login);
+        }
+        if theme_changed {
+            crate::settings::apply_theme(self.mtm(), cfg.theme);
         }
         config::save(&cfg);
     }
@@ -476,12 +482,10 @@ impl Controller {
                 let inner = self.ivars().inner.borrow();
                 inner.shown && inner.current_pid == pid
             };
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!(
-                    "[dbg] transient focused window (subrole={subrole:?}) -> {}",
-                    if keep { "keep bar in place" } else { "hide" }
-                );
-            }
+            tracing::debug!(
+                "transient focused window (subrole={subrole:?}) -> {}",
+                if keep { "keep bar in place" } else { "hide" }
+            );
             if !keep {
                 self.hide_all();
             }
@@ -499,9 +503,7 @@ impl Controller {
                 .is_some_and(|w| !same_element(w, &win))
         };
         if win_changed {
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!("[dbg] window focus changed -> refocus");
-            }
+            tracing::debug!("window focus changed -> refocus");
             self.begin_refocus(pid);
         }
         // Remember the focused window (only when unset) so the next tick can detect a switch away
@@ -550,9 +552,7 @@ impl Controller {
                 || titles.iter().zip(inner.model.iter()).any(|(t, m)| *t != m.title)
         };
         if changed {
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!("[dbg] menu titles changed -> rebuild");
-            }
+            tracing::debug!("menu titles changed -> rebuild");
             self.rebuild_bar_content(pid);
         }
     }
@@ -570,9 +570,7 @@ impl Controller {
             })
         };
         if let Some(bar) = bar {
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!("[dbg] begin_refocus -> kill + rebuild (pid {pid})");
-            }
+            tracing::debug!("begin_refocus -> kill + rebuild (pid {pid})");
             self.hide_fast(bar); // drop the old app's bar instantly
         }
         self.rebuild_bar_content(pid); // build the new app's bar; reconcile fades it in
@@ -592,9 +590,7 @@ impl Controller {
             })
         };
         if let Some(bar) = bar {
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!("[dbg] begin_move -> hide");
-            }
+            tracing::debug!("begin_move -> hide");
             self.hide_fast(bar); // pop out fast during a move; re-pin (fade) once settled
         }
     }
@@ -656,13 +652,11 @@ impl Controller {
         let over_notch = notch_x_span(self.mtm(), pos.x + size.width / 2.0)
             .is_some_and(|(nl, nr)| pos.x < nr && pos.x + bar_size.width > nl);
         if in_strip && (over_menus || over_notch) {
-            if std::env::var_os("LINTEL_DEBUG").is_some() {
-                eprintln!(
-                    "[dbg] hide: {} (winx={:.0} barw={:.0} hide_x={:.0} span=[{:.0},{:.0}])",
-                    if over_notch { "under notch" } else { "near system menus" },
-                    pos.x, bar_size.width, hide_x, menu_left, menu_right
-                );
-            }
+            tracing::debug!(
+                "hide: {} (winx={:.0} barw={:.0} hide_x={:.0} span=[{:.0},{:.0}])",
+                if over_notch { "under notch" } else { "near system menus" },
+                pos.x, bar_size.width, hide_x, menu_left, menu_right
+            );
             self.hide_all();
             return;
         }
@@ -706,19 +700,14 @@ impl Controller {
                 Action::Nothing
             }
         };
-        let debug = std::env::var_os("LINTEL_DEBUG").is_some();
         match action {
             Action::Show(x, y_top, bar) => {
-                if debug {
-                    eprintln!("[dbg] show winpos=({:.0},{:.0}) baro=({x:.0},{y_top:.0})", pos.x, pos.y);
-                }
+                tracing::debug!("show winpos=({:.0},{:.0}) baro=({x:.0},{y_top:.0})", pos.x, pos.y);
                 bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
                 self.show_animated(bar); // fresh focus / settle re-pin -> fade in
             }
             Action::Hide(bar) => {
-                if debug {
-                    eprintln!("[dbg] hide (moving)");
-                }
+                tracing::debug!("hide (moving)");
                 self.hide_fast(bar); // window is moving -> pop out fast
             }
             Action::Nothing => {}
@@ -745,9 +734,7 @@ impl Controller {
             self.ivars().inner.borrow_mut().move_obs = None;
             return;
         }
-        if std::env::var_os("LINTEL_DEBUG").is_some() {
-            eprintln!("[dbg] arm_move_observer pid={pid}");
-        }
+        tracing::debug!("arm_move_observer pid={pid}");
         let observer = unsafe { CFRetained::from_raw(NonNull::new(raw).unwrap()) };
         let mut registered = false;
         for n in [names::AX_WINDOW_MOVED, names::AX_WINDOW_RESIZED] {
@@ -833,12 +820,10 @@ impl Controller {
             }
         }
 
-        if std::env::var_os("LINTEL_DEBUG").is_some() {
-            eprintln!(
-                "[dbg] bar titles: {:?}",
-                model.iter().map(|t| t.title.as_str()).collect::<Vec<_>>()
-            );
-        }
+        tracing::debug!(
+            "bar titles: {:?}",
+            model.iter().map(|t| t.title.as_str()).collect::<Vec<_>>()
+        );
 
         let avail = {
             let mut inner = self.ivars().inner.borrow_mut();
@@ -909,12 +894,10 @@ impl Controller {
             overflow_from = Some(k);
             overflow_btn = Some(ov);
         }
-        if std::env::var_os("LINTEL_DEBUG").is_some() {
-            eprintln!(
-                "[dbg] layout: avail={avail:.0} natural={natural:.0} n={n} visible={visible} overflow={}",
-                overflow_from.is_some()
-            );
-        }
+        tracing::debug!(
+            "layout: avail={avail:.0} natural={natural:.0} n={n} visible={visible} overflow={}",
+            overflow_from.is_some()
+        );
 
         let mut buttons = Vec::with_capacity(visible);
         for btn in btns.into_iter().take(visible) {
@@ -1076,7 +1059,7 @@ impl Controller {
         };
         if let Some(el) = el {
             let err = ax::press(&el);
-            println!("[lintel] AXPress -> {err:?}");
+            tracing::debug!("AXPress -> {err:?}");
         }
     }
 
@@ -1145,7 +1128,7 @@ impl Controller {
         };
         if let Some(el) = el {
             let err = ax::press(&el);
-            println!("[lintel] AXPress -> {err:?}");
+            tracing::debug!("AXPress -> {err:?}");
         }
     }
 

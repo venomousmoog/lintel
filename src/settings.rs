@@ -16,13 +16,43 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSControlStateValueOff,
-    NSControlStateValueOn, NSLayoutAttribute, NSSlider, NSStackView, NSTabView, NSTabViewItem,
-    NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowStyleMask,
+    NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
+    NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSControlStateValueOff,
+    NSControlStateValueOn, NSLayoutAttribute, NSPopUpButton, NSSlider, NSStackView, NSTabView,
+    NSTabViewItem, NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-use crate::config::{Config, HotkeyChord};
+use crate::config::{Config, HotkeyChord, Theme};
+
+/// Apply the app appearance for `theme` (System = follow the OS). Affects all Lintel windows.
+pub fn apply_theme(mtm: MainThreadMarker, theme: Theme) {
+    let app = NSApplication::sharedApplication(mtm);
+    let appearance = match theme {
+        Theme::System => None,
+        Theme::Dark => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }),
+        Theme::Light => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }),
+    };
+    app.setAppearance(appearance.as_deref());
+}
+
+/// The theme choices in popup order (index into this array is the selection index).
+const THEME_ORDER: [Theme; 3] = [Theme::System, Theme::Dark, Theme::Light];
+
+fn theme_index(t: Theme) -> usize {
+    THEME_ORDER.iter().position(|&x| x == t).unwrap_or(0)
+}
+fn theme_from_index(i: usize) -> Theme {
+    *THEME_ORDER.get(i).unwrap_or(&Theme::System)
+}
+fn theme_label(t: Theme) -> &'static str {
+    match t {
+        Theme::System => "System",
+        Theme::Dark => "Dark",
+        Theme::Light => "Light",
+    }
+}
 
 /// Register (or clear) Lintel as a login item via `SMAppService` (macOS 13+). Only takes
 /// effect from a signed `.app` bundle; from `make dev` it logs a harmless error.
@@ -35,8 +65,8 @@ pub fn set_login_item(enabled: bool) {
         unsafe { service.unregisterAndReturnError() }
     };
     if let Err(e) = res {
-        eprintln!(
-            "[login-item] {} failed: {e:?}",
+        tracing::warn!(
+            "login item {} failed: {e:?}",
             if enabled { "register" } else { "unregister" }
         );
     }
@@ -99,6 +129,13 @@ define_class!(
             self.ivars().config.borrow_mut().launch_at_login = is_on(sender);
             self.emit();
         }
+
+        #[unsafe(method(themeSelected:))]
+        fn theme_selected(&self, sender: &NSPopUpButton) {
+            let idx = sender.indexOfSelectedItem().max(0) as usize;
+            self.ivars().config.borrow_mut().theme = theme_from_index(idx);
+            self.emit();
+        }
     }
 );
 
@@ -150,6 +187,14 @@ pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn)
 
     // --- General ---
     let general = vstack(mtm);
+    let theme_popup = popup(
+        mtm,
+        THEME_ORDER.iter().map(|&t| theme_label(t)),
+        theme_index(cfg.theme),
+        target,
+        sel!(themeSelected:),
+    );
+    add(&general, &row(mtm, "Appearance", &theme_popup));
     add(
         &general,
         &checkbox(
@@ -299,6 +344,26 @@ fn slider_row(
 
 fn make_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
     NSTextField::labelWithString(&NSString::from_str(text), mtm)
+}
+
+/// A pop-up button with `titles`, `selected` index, wired to `action` on `target`.
+fn popup<'a>(
+    mtm: MainThreadMarker,
+    titles: impl Iterator<Item = &'a str>,
+    selected: usize,
+    target: &AnyObject,
+    action: objc2::runtime::Sel,
+) -> Retained<NSPopUpButton> {
+    let p = NSPopUpButton::new(mtm);
+    for title in titles {
+        p.addItemWithTitle(&NSString::from_str(title));
+    }
+    p.selectItemAtIndex(selected as isize);
+    unsafe {
+        p.setTarget(Some(target));
+        p.setAction(Some(action));
+    }
+    p
 }
 
 /// A `[label]   [control]` horizontal row.

@@ -32,6 +32,20 @@ fn default_palette_hotkey() -> HotkeyChord {
     HotkeyChord::default()
 }
 
+/// App appearance: follow the system, or force Dark / Light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Theme {
+    System,
+    Dark,
+    Light,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::System
+    }
+}
+
 fn default_fade_ms() -> u32 {
     200
 }
@@ -60,6 +74,9 @@ pub struct Config {
     /// Global hotkey that opens the command palette (menu type-ahead search).
     #[serde(default = "default_palette_hotkey")]
     pub palette_hotkey: HotkeyChord,
+    /// App appearance (System / Dark / Light).
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 impl Default for Config {
@@ -70,6 +87,7 @@ impl Default for Config {
             poll_hz: default_poll_hz(),
             launch_at_login: false,
             palette_hotkey: HotkeyChord::default(),
+            theme: Theme::System,
         }
     }
 }
@@ -121,14 +139,14 @@ pub fn load_from(path: &Path) -> Config {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
         Err(e) => {
-            eprintln!("[cfg] read failed ({}); using defaults: {e}", path.display());
+            tracing::warn!("config read failed ({}); using defaults: {e}", path.display());
             return Config::default();
         }
     };
     match toml::from_str(&text) {
         Ok(cfg) => cfg,
         Err(e) => {
-            eprintln!("[cfg] parse failed ({}); using defaults: {e}", path.display());
+            tracing::warn!("config parse failed ({}); using defaults: {e}", path.display());
             Config::default()
         }
     }
@@ -140,7 +158,7 @@ pub fn save(config: &Config) {
         return;
     };
     if let Err(e) = save_to(&path, config) {
-        eprintln!("[cfg] save failed: {e}");
+        tracing::warn!("config save failed: {e}");
     }
 }
 
@@ -169,6 +187,7 @@ mod tests {
             poll_hz: 45,
             launch_at_login: true,
             palette_hotkey: HotkeyChord { mods: 0x0100, keycode: 0x23 },
+            theme: Theme::Dark,
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
@@ -207,6 +226,7 @@ mod tests {
             poll_hz: 0,
             launch_at_login: false,
             palette_hotkey: HotkeyChord::default(),
+            theme: Theme::default(),
         }
         .sanitized();
         assert_eq!(c.fade_ms, 2000);

@@ -15,25 +15,28 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSButton, NSColor, NSControl, NSFocusRingType, NSFont,
-    NSFontAttributeName, NSForegroundColorAttributeName, NSLayoutAttribute, NSLineBreakMode, NSPanel,
-    NSProgressIndicator, NSScreen, NSStackView, NSTextAlignment, NSTextField, NSTextView,
-    NSUserInterfaceLayoutOrientation, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial,
-    NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationOptions, NSBackingStoreType, NSButton, NSColor, NSControl,
+    NSFocusRingType, NSFont, NSRunningApplication,
+    NSFontAttributeName, NSForegroundColorAttributeName, NSLayoutAttribute, NSLineBreakMode,
+    NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSProgressIndicator, NSScreen,
+    NSStackView, NSTextAlignment, NSTextField, NSTextView, NSUserInterfaceLayoutOrientation, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowStyleMask,
 };
 use objc2_application_services::AXUIElement;
 use objc2_core_foundation::CFRetained;
 use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSMutableAttributedString, NSNotification, NSPoint, NSRect,
-    NSSize, NSString, NSTimer,
+    NSAttributedString, NSDictionary, NSMutableAttributedString, NSNotification, NSPoint, NSRange,
+    NSRect, NSSize, NSString, NSTimer,
 };
 
 use crate::ax::{self, names};
 
 const PANEL_W: f64 = 620.0;
 const MAX_RESULTS: usize = 12;
-const FIELD_X: f64 = 14.0; // search field left/right inset
-const LIST_X: f64 = 6.0; // results left/right inset (a small margin around the options)
+const FIELD_X: f64 = 18.0; // search field left/right inset (aligned with the indented row text)
+const LIST_X: f64 = 10.0; // results left/right inset — margin so the highlight doesn't touch the edges
+const TEXT_INSET: f64 = 8.0; // left padding of row text INSIDE the highlight
 const TOP: f64 = 12.0; // margin above the field
 const FIELD_H: f64 = 28.0;
 const SEP_GAP: f64 = 8.0; // gap between field and the results list
@@ -41,7 +44,6 @@ const ROW_H: f64 = 28.0; // single-line row height
 const ROW_H_HELP: f64 = 44.0; // two-line row (leaf + help text)
 const ROW_SPACING: f64 = 1.0;
 const BOTTOM: f64 = 10.0; // margin below the last row
-const ANCHOR_DROP: f64 = 48.0; // how far below the window's top edge the palette sits
 
 // ---- index (built off the main thread) ----------------------------------------------------
 
@@ -218,7 +220,7 @@ fn fire(pid: i32, path: &[String]) {
     }
     if let Some(leaf) = current {
         let err = ax::press(&leaf);
-        println!("[lintel] palette fire {path:?} -> {err:?}");
+        tracing::debug!("palette fire {path:?} -> {err:?}");
     }
 }
 
@@ -253,8 +255,8 @@ struct PaletteIvars {
     field: Retained<NSTextField>,
     results: Retained<NSStackView>,
     spinner: Retained<NSProgressIndicator>,
-    anchor_top: Cell<f64>, // fixed Cocoa y of the panel's top edge (grows downward)
-    center_x: Cell<f64>,   // fixed Cocoa x the panel is centered on
+    center_x: Cell<f64>, // fixed Cocoa point the panel is centered on (x, y)
+    center_y: Cell<f64>,
     matches: RefCell<Vec<Command>>,
     rows: RefCell<Vec<Retained<NSButton>>>,
     selected: Cell<usize>,
@@ -337,8 +339,8 @@ impl PaletteController {
         field: Retained<NSTextField>,
         results: Retained<NSStackView>,
         spinner: Retained<NSProgressIndicator>,
-        anchor_top: f64,
         center_x: f64,
+        center_y: f64,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(PaletteIvars {
             pid,
@@ -349,8 +351,8 @@ impl PaletteController {
             field,
             results,
             spinner,
-            anchor_top: Cell::new(anchor_top),
             center_x: Cell::new(center_x),
+            center_y: Cell::new(center_y),
             matches: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
             selected: Cell::new(0),
@@ -418,12 +420,12 @@ impl PaletteController {
         self.restyle_selection();
     }
 
-    /// Resize the panel to `height` (anchored at its top edge) and re-place the sub-views.
+    /// Resize the panel to `height` (kept centered on the parent window) and re-place the sub-views.
     fn relayout(&self, height: f64) {
         let panel = &self.ivars().panel;
         let origin = NSPoint::new(
             self.ivars().center_x.get() - PANEL_W / 2.0,
-            self.ivars().anchor_top.get() - height,
+            self.ivars().center_y.get() - height / 2.0,
         );
         panel.setFrame_display(NSRect::new(origin, NSSize::new(PANEL_W, height)), true);
 
@@ -447,10 +449,16 @@ impl PaletteController {
 
     fn restyle_selection(&self) {
         let sel = self.ivars().selected.get();
+        let matches = self.ivars().matches.borrow();
         for (i, row) in self.ivars().rows.borrow().iter().enumerate() {
+            let selected = i == sel;
+            // Native list selection: solid emphasized accent + white text on the selected row.
+            if let Some(cmd) = matches.get(i) {
+                row.setAttributedTitle(&row_title(cmd, selected));
+            }
             if let Some(layer) = row.layer() {
-                let bg = if i == sel {
-                    NSColor::controlAccentColor().colorWithAlphaComponent(0.30).CGColor()
+                let bg = if selected {
+                    NSColor::selectedContentBackgroundColor().CGColor()
                 } else {
                     NSColor::clearColor().CGColor()
                 };
@@ -487,6 +495,14 @@ impl PaletteController {
             t.invalidate();
         }
         self.ivars().panel.orderOut(None);
+        // We stole activation to take key focus; hand it back to the app that was frontmost when the
+        // palette opened, so keyboard focus returns to the window the user was in.
+        if let Some(app) =
+            NSRunningApplication::runningApplicationWithProcessIdentifier(self.ivars().pid)
+        {
+            #[allow(deprecated)]
+            app.activateWithOptions(NSApplicationActivationOptions::empty());
+        }
         PANEL.with(|p| *p.borrow_mut() = None);
         CONTROLLER.with(|c| *c.borrow_mut() = None);
     }
@@ -513,33 +529,57 @@ fn attr_run(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributed
     }
 }
 
-/// Build one result row (a borderless, left-aligned button). When the command has AXHelp text it is
-/// rendered as a dimmed second line.
+/// The attributed title for a row: `path ▸ leaf   shortcut` (+ a dimmed AXHelp second line). When
+/// `selected`, text is the selection text color (white) to read on the solid selection background.
+fn row_title(cmd: &Command, selected: bool) -> Retained<NSMutableAttributedString> {
+    let mut line1 = cmd.path.join(" ▸ ");
+    if let Some(sc) = &cmd.shortcut {
+        line1.push_str(&format!("    {sc}"));
+    }
+    // Solid selection bg is the emphasized accent, so the selected row's text is white (matching
+    // native list selection). alternateSelectedControlTextColor doesn't resolve to white as an
+    // attributed-title color here, so use white directly.
+    let primary = if selected {
+        NSColor::whiteColor()
+    } else if cmd.enabled {
+        NSColor::labelColor()
+    } else {
+        NSColor::secondaryLabelColor()
+    };
+    let secondary = if selected {
+        NSColor::whiteColor().colorWithAlphaComponent(0.75)
+    } else {
+        NSColor::secondaryLabelColor()
+    };
+    // In-menu font (what dropdown items use), NOT the bolder menu-bar title font.
+    let title = NSMutableAttributedString::new();
+    title.appendAttributedString(&attr_run(&line1, &NSFont::menuFontOfSize(0.0), &primary));
+    if let Some(help) = &cmd.help {
+        title.appendAttributedString(&attr_run(
+            &format!("\n{help}"),
+            &NSFont::menuFontOfSize(11.0),
+            &secondary,
+        ));
+    }
+    // Left padding inside the highlight so the text isn't flush against its rounded edge.
+    let para = NSMutableParagraphStyle::new();
+    para.setFirstLineHeadIndent(TEXT_INSET);
+    para.setHeadIndent(TEXT_INSET);
+    let range = NSRange::new(0, title.length());
+    unsafe {
+        title.addAttribute_value_range(NSParagraphStyleAttributeName, &para, range);
+    }
+    title
+}
+
+/// Build one result row (a borderless, left-aligned button). `restyle_selection` sets its title
+/// color + background per selection; here we set the unselected title.
 fn make_row(
     mtm: MainThreadMarker,
     cmd: &Command,
     target: &AnyObject,
     tag: isize,
 ) -> Retained<NSButton> {
-    let mut line1 = cmd.path.join(" ▸ ");
-    if let Some(sc) = &cmd.shortcut {
-        line1.push_str(&format!("    {sc}"));
-    }
-    let color = if cmd.enabled {
-        NSColor::labelColor()
-    } else {
-        NSColor::secondaryLabelColor()
-    };
-    // In-menu font (what dropdown items use), NOT the bolder menu-bar title font.
-    let title = NSMutableAttributedString::new();
-    title.appendAttributedString(&attr_run(&line1, &NSFont::menuFontOfSize(0.0), &color));
-    if let Some(help) = &cmd.help {
-        title.appendAttributedString(&attr_run(
-            &format!("\n{help}"),
-            &NSFont::menuFontOfSize(11.0),
-            &NSColor::secondaryLabelColor(),
-        ));
-    }
     let btn = unsafe {
         NSButton::buttonWithTitle_target_action(
             &NSString::from_str(""),
@@ -549,7 +589,7 @@ fn make_row(
         )
     };
     btn.setBordered(false);
-    btn.setAttributedTitle(&title);
+    btn.setAttributedTitle(&row_title(cmd, false));
     btn.setAlignment(NSTextAlignment::Left);
     btn.setTag(tag);
     btn.setWantsLayer(true);
@@ -570,6 +610,7 @@ pub fn open(mtm: MainThreadMarker, pid: i32) {
     if PANEL.with(|p| p.borrow().is_some()) {
         return;
     }
+    tracing::debug!("palette open pid={pid}");
 
     // Placeholder size; relayout() sizes the panel to its content on the first refilter.
     let init = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_W, 120.0));
@@ -645,8 +686,8 @@ pub fn open(mtm: MainThreadMarker, pid: i32) {
         std::thread::spawn(move || build_index(pid, idx));
     }
 
-    // Anchor: x-centered on the focused window, top edge a little below the window's top.
-    let (cx, top_y) = target_top_center(mtm, pid);
+    // Center the palette on the focused window.
+    let (cx, cy) = target_center(mtm, pid);
 
     let controller = PaletteController::new(
         mtm,
@@ -658,8 +699,8 @@ pub fn open(mtm: MainThreadMarker, pid: i32) {
         field.clone(),
         results.clone(),
         spinner.clone(),
-        top_y - ANCHOR_DROP,
         cx,
+        cy,
     );
     // Wire delegates (field editing + window key changes) via raw msg_send (avoids protocol casts).
     let ctrl_obj: &AnyObject = &controller;
@@ -690,8 +731,8 @@ pub fn open(mtm: MainThreadMarker, pid: i32) {
     CONTROLLER.with(|c| *c.borrow_mut() = Some(controller));
 }
 
-/// Cocoa (center-x, top-edge-y) of `pid`'s focused window; falls back to the main screen top-center.
-fn target_top_center(mtm: MainThreadMarker, pid: i32) -> (f64, f64) {
+/// Cocoa (center-x, center-y) of `pid`'s focused window; falls back to the main screen center.
+fn target_center(mtm: MainThreadMarker, pid: i32) -> (f64, f64) {
     let primary_h = NSScreen::screens(mtm)
         .iter()
         .next()
@@ -704,14 +745,15 @@ fn target_top_center(mtm: MainThreadMarker, pid: i32) -> (f64, f64) {
             ax::attr_point(&win, names::AX_POSITION),
             ax::attr_size(&win, names::AX_SIZE),
         ) {
-            return (p.x + s.width / 2.0, primary_h - p.y);
+            // AX is top-left/y-down; flip the window's vertical center to Cocoa y-up.
+            return (p.x + s.width / 2.0, primary_h - (p.y + s.height / 2.0));
         }
     }
     if let Some(screen) = NSScreen::mainScreen(mtm) {
         let f = screen.frame();
-        return (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height - 120.0);
+        return (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0);
     }
-    (700.0, primary_h - 120.0)
+    (700.0, primary_h / 2.0)
 }
 
 #[cfg(test)]

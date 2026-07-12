@@ -160,8 +160,19 @@ fn redirect_logs_if_detached() {
     }
 }
 
+/// Structured logging (`tracing`), modeled on ~/src/canopy. Writes to stderr, which
+/// `redirect_logs_if_detached` tees to ~/Library/Logs/Lintel/lintel.log for `open`ed runs. Default
+/// level is `info`; set `RUST_LOG=lintel=debug` (e.g. run the bundled binary directly) for the
+/// verbose per-frame diagnostics — no more adding/removing `println!`s.
+fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = fmt().with_env_filter(filter).with_ansi(false).try_init();
+}
+
 fn cmd_run() {
     redirect_logs_if_detached();
+    init_tracing();
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
     // Don't exit if untrusted — keep running (status item stays up) and start working once
     // Accessibility is granted (the tick loop re-checks each frame).
