@@ -32,6 +32,10 @@ fn default_palette_hotkey() -> HotkeyChord {
     HotkeyChord::default()
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// App appearance: follow the system, or force Dark / Light.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
@@ -71,6 +75,9 @@ pub struct Config {
     /// Launch Lintel automatically at login (via `SMAppService`).
     #[serde(default)]
     pub launch_at_login: bool,
+    /// Whether the command palette (menu type-ahead) is enabled (registers its hotkey).
+    #[serde(default = "default_true")]
+    pub palette_enabled: bool,
     /// Global hotkey that opens the command palette (menu type-ahead search).
     #[serde(default = "default_palette_hotkey")]
     pub palette_hotkey: HotkeyChord,
@@ -86,6 +93,7 @@ impl Default for Config {
             settle_ms: default_settle_ms(),
             poll_hz: default_poll_hz(),
             launch_at_login: false,
+            palette_enabled: true,
             palette_hotkey: HotkeyChord::default(),
             theme: Theme::System,
         }
@@ -186,6 +194,7 @@ mod tests {
             settle_ms: 90,
             poll_hz: 45,
             launch_at_login: true,
+            palette_enabled: false,
             palette_hotkey: HotkeyChord { mods: 0x0100, keycode: 0x23 },
             theme: Theme::Dark,
         };
@@ -225,6 +234,7 @@ mod tests {
             settle_ms: 99_999,
             poll_hz: 0,
             launch_at_login: false,
+            palette_enabled: true,
             palette_hotkey: HotkeyChord::default(),
             theme: Theme::default(),
         }

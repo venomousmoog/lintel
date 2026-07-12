@@ -23,7 +23,7 @@ use objc2_app_kit::{
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindowStyleMask,
 };
-use objc2_application_services::AXUIElement;
+use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::CFRetained;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableAttributedString, NSNotification, NSPoint, NSRange,
@@ -195,24 +195,29 @@ fn ranked(query: &str, commands: &[Command]) -> Vec<Command> {
 // ---- firing (main thread; re-resolve the path against the live tree) ----------------------
 
 /// Fire the command at `path` in app `pid` by re-resolving each path component live and `AXPress`.
-fn fire(pid: i32, path: &[String]) {
+///
+/// Re-resolution matters: menu-item `AXUIElement` handles cached from an earlier tree walk go
+/// stale when the app rebuilds or lazily repopulates its menus (Electron, etc.), and `AXPress`
+/// on a stale handle silently no-ops. Resolving fresh by title against the live tree at fire
+/// time is what actually triggers the action. Returns `true` if a matching leaf was pressed OK.
+pub(crate) fn fire(pid: i32, path: &[String]) -> bool {
     if path.is_empty() {
-        return;
+        return false;
     }
     let app = ax::app_element(pid);
     ax::set_timeout(&app, 2.0);
     let Some(menubar) = ax::attr_element(&app, names::AX_MENU_BAR) else {
-        return;
+        return false;
     };
     let mut current: Option<CFRetained<AXUIElement>> = ax::children(&menubar)
         .into_iter()
         .find(|top| ax::attr_string(top, names::AX_TITLE).as_deref() == Some(path[0].as_str()));
     for comp in &path[1..] {
         let Some(node) = current else {
-            return;
+            return false;
         };
         let Some(menu) = ax::children(&node).into_iter().next() else {
-            return;
+            return false;
         };
         current = ax::children(&menu)
             .into_iter()
@@ -220,8 +225,10 @@ fn fire(pid: i32, path: &[String]) {
     }
     if let Some(leaf) = current {
         let err = ax::press(&leaf);
-        tracing::debug!("palette fire {path:?} -> {err:?}");
+        tracing::debug!("fire {path:?} -> {err:?}");
+        return err == AXError::Success;
     }
+    false
 }
 
 // ---- UI -----------------------------------------------------------------------------------

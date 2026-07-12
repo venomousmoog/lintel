@@ -225,8 +225,9 @@ define_class!(
 
         #[unsafe(method(itemClicked:))]
         fn item_clicked_(&self, sender: Option<&AnyObject>) {
-            if let Some(b) = sender.and_then(|s| s.downcast_ref::<NSButton>()) {
-                self.on_item_clicked(b.tag() as usize);
+            // The sender of a menu item's action is the NSMenuItem itself, not a button.
+            if let Some(mi) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
+                self.on_item_clicked(mi.tag() as usize);
             }
         }
 
@@ -247,6 +248,11 @@ define_class!(
         #[unsafe(method(checkSwitch:))]
         fn check_switch_(&self, _timer: &NSTimer) {
             self.check_switch();
+        }
+
+        #[unsafe(method(openSettingsDeferred:))]
+        fn open_settings_deferred_(&self, _timer: &NSTimer) {
+            self.open_settings();
         }
 
         #[unsafe(method(openSettings:))]
@@ -320,9 +326,17 @@ impl Controller {
         crate::settings::apply_theme(self.mtm(), self.ivars().inner.borrow().config.theme);
     }
 
-    /// Register the global command-palette hotkey from config (RAII guard kept in `inner.hotkey`).
+    /// (Re)register the global command-palette hotkey from config. Drops any prior registration
+    /// first (RAII unregisters); a no-op beyond that when the palette is disabled.
     fn register_hotkey(&self) {
-        let chord = self.ivars().inner.borrow().config.palette_hotkey;
+        self.ivars().inner.borrow_mut().hotkey = None; // unregister the old chord
+        let (enabled, chord) = {
+            let inner = self.ivars().inner.borrow();
+            (inner.config.palette_enabled, inner.config.palette_hotkey)
+        };
+        if !enabled {
+            return;
+        }
         let this = self.retain();
         match crate::hotkey::HotkeyRegistration::install(chord.mods, chord.keycode, move || {
             this.on_palette_hotkey()
@@ -372,12 +386,14 @@ impl Controller {
     /// poll rate changed, (un)register the login item if that flipped), and persist to disk.
     fn apply_and_save_config(&self, cfg: Config) {
         let cfg = cfg.sanitized();
-        let (poll_changed, login_changed, theme_changed) = {
+        let (poll_changed, login_changed, theme_changed, hotkey_changed) = {
             let inner = self.ivars().inner.borrow();
             (
                 inner.config.poll_hz != cfg.poll_hz,
                 inner.config.launch_at_login != cfg.launch_at_login,
                 inner.config.theme != cfg.theme,
+                inner.config.palette_enabled != cfg.palette_enabled
+                    || inner.config.palette_hotkey != cfg.palette_hotkey,
             )
         };
         self.ivars().inner.borrow_mut().config = cfg.clone();
@@ -390,11 +406,27 @@ impl Controller {
         if theme_changed {
             crate::settings::apply_theme(self.mtm(), cfg.theme);
         }
+        if hotkey_changed {
+            self.register_hotkey();
+        }
         config::save(&cfg);
     }
 
+    /// Open the settings window on the next run-loop pass (used at launch, once the app is up).
+    pub fn open_settings_soon(&self) {
+        unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                0.1,
+                self,
+                sel!(openSettingsDeferred:),
+                None,
+                false,
+            );
+        }
+    }
+
     /// Open the settings window, wiring its read/write closures back to this controller.
-    fn open_settings(&self) {
+    pub fn open_settings(&self) {
         let r = self.retain();
         let read: std::rc::Rc<dyn Fn() -> Config> = std::rc::Rc::new(move || r.current_config());
         let w = self.retain();
@@ -1049,18 +1081,35 @@ impl Controller {
     }
 
     fn on_item_clicked(&self, j: usize) {
-        let el = {
+        let (pid, path, el) = {
             let inner = self.ivars().inner.borrow();
-            inner
+            let pid = inner.current_pid;
+            let entry = inner
                 .open_top
                 .and_then(|t| inner.model.get(t))
-                .and_then(|top| top.items.get(j))
-                .map(|it| it.el.clone())
+                .and_then(|top| top.items.get(j).map(|it| (top, it)));
+            match entry {
+                Some((top, it)) => (
+                    pid,
+                    vec![top.title.clone(), it.title.clone()],
+                    it.el.clone(),
+                ),
+                None => return,
+            }
         };
-        if let Some(el) = el {
-            let err = ax::press(&el);
-            tracing::debug!("AXPress -> {err:?}");
+        self.fire_menu(pid, &path, &el);
+    }
+
+    /// Trigger a menu item: re-resolve its `path` against the app's live menu tree and `AXPress`
+    /// the fresh element (cached menu-item handles go stale — see `palette::fire`). Falls back to
+    /// pressing the cached element only if re-resolution can't find the item (e.g. no `AXTitle`).
+    fn fire_menu(&self, pid: i32, path: &[String], cached: &CFRetained<AXUIElement>) {
+        if crate::palette::fire(pid, path) {
+            return;
         }
+        tracing::debug!("fire_menu re-resolve failed for {path:?}; pressing cached element");
+        let err = ax::press(cached);
+        tracing::debug!("AXPress(cached) -> {err:?}");
     }
 
     /// The `»` overflow button was clicked: pop up a menu whose items are the overflowed top-level
@@ -1118,18 +1167,19 @@ impl Controller {
     /// A leaf item of the overflow menu was chosen; its tag encodes `(top << 16) | item`.
     fn on_overflow_item(&self, tag: isize) {
         let (top, item) = ((tag >> 16) as usize, (tag & 0xFFFF) as usize);
-        let el = {
+        let (pid, path, el) = {
             let inner = self.ivars().inner.borrow();
-            inner
+            let pid = inner.current_pid;
+            let entry = inner
                 .model
                 .get(top)
-                .and_then(|t| t.items.get(item))
-                .map(|it| it.el.clone())
+                .and_then(|t| t.items.get(item).map(|it| (t, it)));
+            match entry {
+                Some((t, it)) => (pid, vec![t.title.clone(), it.title.clone()], it.el.clone()),
+                None => return,
+            }
         };
-        if let Some(el) = el {
-            let err = ax::press(&el);
-            tracing::debug!("AXPress -> {err:?}");
-        }
+        self.fire_menu(pid, &path, &el);
     }
 
     /// Convert an AX window position (global top-left, y-down) to the Cocoa y of the window's top

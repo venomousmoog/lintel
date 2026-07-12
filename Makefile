@@ -30,10 +30,12 @@ dev:
 	$(CARGO) run
 
 # Build + sign the .app, kill any old instance, and launch it detached.
+# Pass extra args to the app with RUN_ARGS, e.g. `make run RUN_ARGS=--settings` to open Settings
+# on launch (handy while iterating, since a restart otherwise closes the Settings window).
 run: bundle
 	@killall $(BIN) 2>/dev/null || true
 	@sleep 0.3
-	open $(APP)
+	open $(APP) $(if $(RUN_ARGS),--args $(RUN_ARGS),)
 	@echo "==> Lintel launched in the background (menu-bar icon > Quit Lintel). Logs: make logs"
 
 # Build a signed Lintel.app that runs headless (LSUIElement) with a menu-bar icon.

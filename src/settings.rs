@@ -14,15 +14,17 @@ use std::rc::Rc;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, Sel};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{
     NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSApplication,
     NSAutoresizingMaskOptions, NSBackingStoreType, NSButton, NSControlStateValueOff,
-    NSControlStateValueOn, NSLayoutAttribute, NSPopUpButton, NSSlider, NSStackView, NSTabView,
-    NSTabViewItem, NSTextField, NSUserInterfaceLayoutOrientation, NSView, NSWindow,
-    NSWindowStyleMask,
+    NSControlStateValueOn, NSEvent, NSEventMask, NSEventModifierFlags, NSLayoutAttribute,
+    NSPopUpButton, NSSlider, NSStackView, NSTabView, NSTabViewItem, NSTextField,
+    NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowStyleMask,
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use block2::RcBlock;
+use core::ptr::NonNull;
 
 use crate::config::{Config, HotkeyChord, Theme};
 
@@ -88,6 +90,8 @@ struct ControllerIvars {
     fade_label: LabelSlot,
     settle_label: LabelSlot,
     poll_label: LabelSlot,
+    hotkey_button: RefCell<Option<Retained<NSButton>>>, // shows the chord; click to re-record
+    monitor: RefCell<Option<Retained<AnyObject>>>,      // active key-capture event monitor
 }
 
 define_class!(
@@ -136,6 +140,17 @@ define_class!(
             self.ivars().config.borrow_mut().theme = theme_from_index(idx);
             self.emit();
         }
+
+        #[unsafe(method(paletteToggled:))]
+        fn palette_toggled(&self, sender: &NSButton) {
+            self.ivars().config.borrow_mut().palette_enabled = is_on(sender);
+            self.emit();
+        }
+
+        #[unsafe(method(recordHotkey:))]
+        fn record_hotkey(&self, _sender: &NSButton) {
+            self.start_recording();
+        }
     }
 );
 
@@ -147,6 +162,8 @@ impl SettingsController {
             fade_label: RefCell::new(None),
             settle_label: RefCell::new(None),
             poll_label: RefCell::new(None),
+            hotkey_button: RefCell::new(None),
+            monitor: RefCell::new(None),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -156,11 +173,82 @@ impl SettingsController {
         let cfg = self.ivars().config.borrow().clone();
         (self.ivars().write)(cfg);
     }
+
+    /// Begin capturing the next chord for the palette hotkey via a local key-down monitor.
+    fn start_recording(&self) {
+        if self.ivars().monitor.borrow().is_some() {
+            return; // already recording
+        }
+        if let Some(btn) = self.ivars().hotkey_button.borrow().as_ref() {
+            btn.setTitle(&NSString::from_str("Type a shortcut… (⎋ to cancel)"));
+        }
+        let this = self.retain();
+        let handler = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+            let event = unsafe { event.as_ref() };
+            let keycode = event.keyCode();
+            if keycode == 53 {
+                this.finish_recording(None); // Esc cancels
+                return std::ptr::null_mut();
+            }
+            let mods = event.modifierFlags();
+            // Require a real modifier (⌘/⌃/⌥) — a bare or Shift-only global hotkey is a bad idea.
+            let has_mod = mods.intersects(
+                NSEventModifierFlags::Command
+                    | NSEventModifierFlags::Control
+                    | NSEventModifierFlags::Option,
+            );
+            if has_mod {
+                this.finish_recording(Some(HotkeyChord {
+                    mods: carbon_mods(mods),
+                    keycode: keycode as u32,
+                }));
+            }
+            std::ptr::null_mut() // swallow the key while recording
+        });
+        let monitor = unsafe {
+            NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &handler)
+        };
+        *self.ivars().monitor.borrow_mut() = monitor;
+    }
+
+    /// Stop capturing; if `chord` is `Some`, adopt it. Restores the button label either way.
+    fn finish_recording(&self, chord: Option<HotkeyChord>) {
+        if let Some(m) = self.ivars().monitor.borrow_mut().take() {
+            unsafe { NSEvent::removeMonitor(&m) };
+        }
+        if let Some(chord) = chord {
+            self.ivars().config.borrow_mut().palette_hotkey = chord;
+            self.emit();
+        }
+        let chord = self.ivars().config.borrow().palette_hotkey;
+        if let Some(btn) = self.ivars().hotkey_button.borrow().as_ref() {
+            btn.setTitle(&NSString::from_str(&hotkey_display(chord)));
+        }
+    }
+}
+
+/// Translate `NSEventModifierFlags` to a Carbon modifier mask (for `RegisterEventHotKey`).
+fn carbon_mods(m: NSEventModifierFlags) -> u32 {
+    let mut c = 0;
+    if m.contains(NSEventModifierFlags::Command) {
+        c |= 0x0100;
+    }
+    if m.contains(NSEventModifierFlags::Shift) {
+        c |= 0x0200;
+    }
+    if m.contains(NSEventModifierFlags::Option) {
+        c |= 0x0800;
+    }
+    if m.contains(NSEventModifierFlags::Control) {
+        c |= 0x1000;
+    }
+    c
 }
 
 /// Open (or replace) the settings window. `read` snapshots the current config; `write`
 /// receives the updated config on every control change. Main thread only.
 pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn) {
+    tracing::debug!("settings::open");
     let cfg = read();
 
     let controller = SettingsController::new(mtm, cfg.clone(), write);
@@ -205,6 +293,26 @@ pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn)
             sel!(launchToggled:),
         ),
     );
+    add(
+        &general,
+        &checkbox(
+            mtm,
+            target,
+            "Enable command palette",
+            cfg.palette_enabled,
+            sel!(paletteToggled:),
+        ),
+    );
+    let hotkey_btn = unsafe {
+        NSButton::buttonWithTitle_target_action(
+            &NSString::from_str(&hotkey_display(cfg.palette_hotkey)),
+            Some(target),
+            Some(sel!(recordHotkey:)),
+            mtm,
+        )
+    };
+    *controller.ivars().hotkey_button.borrow_mut() = Some(hotkey_btn.clone());
+    add(&general, &row(mtm, "Palette hotkey", &hotkey_btn));
     tabs.addTabViewItem(&tab_item(mtm, "General", &general));
 
     // --- Advanced ---
@@ -239,15 +347,6 @@ pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn)
         ),
     );
 
-    add(
-        &advanced,
-        &row(
-            mtm,
-            "Command palette",
-            &make_label(mtm, &hotkey_display(cfg.palette_hotkey)),
-        ),
-    );
-
     tabs.addTabViewItem(&tab_item(mtm, "Advanced", &advanced));
 
     if let Some(content) = window.contentView() {
@@ -260,7 +359,15 @@ pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn)
         ));
     }
 
-    window.center();
+    // Reopen the window where it was last left (handy while iterating with `--settings`, so it
+    // returns to your chosen monitor/spot instead of centering on the active screen). Cocoa's
+    // frame autosave persists via `cfprefsd`, so it survives the `killall` on restart — a
+    // `windowWillClose:` hook wouldn't, since SIGTERM skips it. Center only on first-ever run.
+    let autosave = NSString::from_str("LintelSettings");
+    window.setFrameAutosaveName(&autosave); // save position/size on every future move + resize
+    if !window.setFrameUsingName(&autosave) {
+        window.center();
+    }
     // Accessory apps must activate to bring a regular window frontmost.
     #[allow(deprecated)]
     NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);

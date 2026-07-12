@@ -170,7 +170,7 @@ fn init_tracing() {
     let _ = fmt().with_env_filter(filter).with_ansi(false).try_init();
 }
 
-fn cmd_run() {
+fn cmd_run(open_settings: bool) {
     redirect_logs_if_detached();
     init_tracing();
     let mtm = MainThreadMarker::new().expect("must run on the main thread");
@@ -189,6 +189,11 @@ fn cmd_run() {
 
     let ns = NSApplication::sharedApplication(mtm);
     ns.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    if open_settings {
+        // --settings: pop Settings on launch (handy while iterating). Deferred to the next run-loop
+        // pass so the app is fully up (activation + window ordering take effect).
+        controller.open_settings_soon();
+    }
     ns.run();
     drop(controller); // keep alive for the run loop's lifetime
 }
@@ -317,8 +322,10 @@ fn cmd_watch() {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `--settings` (anywhere) launches run mode with the Settings window open.
+    let open_settings = args.iter().any(|a| a == "--settings");
     match args.get(1).map(String::as_str) {
-        Some("run") => cmd_run(),
+        Some("run") | None => cmd_run(open_settings), // default (incl. the .app bundle)
         Some("watch") => cmd_watch(),
         Some("press") => match (args.get(2), args.get(3)) {
             (Some(top), Some(item)) => cmd_press(top, item),
@@ -326,7 +333,7 @@ fn main() {
         },
         Some("read") => cmd_read(),
         Some("diag") => cmd_diag(args.get(2).map(String::as_str)),
-        None => cmd_run(), // default (incl. when launched as a .app bundle)
+        Some(s) if s.starts_with("--") => cmd_run(open_settings), // e.g. `open --args --settings`
         Some(other) => {
             eprintln!("unknown command '{other}' (try: run | read | press | watch | diag [app])")
         }
