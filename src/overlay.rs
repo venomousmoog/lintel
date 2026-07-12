@@ -48,6 +48,7 @@ const NS_STATUS_LEVEL: isize = 25; // draws over the static system menu bar (des
 const MENU_RECHECK: Duration = Duration::from_millis(500); // re-read the current app's menus this often
 const STANDARD_WINDOW_SUBROLE: &str = "AXStandardWindow"; // only mirror the menu above real windows
 const MENU_HIDE_FACTOR: f64 = 1.5; // hide when within this multiple of the menu's length of its start
+const OVERFLOW_LABEL: &str = "»"; // the overflow button shown when top menus don't fit the window
 const ITEM_SPACING: f64 = 20.0; // gap between top-level menu titles
 const BAR_EDGE: f64 = 14.0; // left/right padding inside the bar
 const BAR_V_MARGIN: f64 = 6.0; // extra height beyond the system menu bar (vertical breathing room)
@@ -180,7 +181,10 @@ struct Inner {
     settle_at: Option<Instant>,            // re-show once the window is still past this instant
     shown: bool,                           // bar is currently on screen
     highlight: Option<Retained<NSView>>,   // pill behind the active title while its menu is open
-    buttons: Vec<Retained<NSButton>>,      // the top-level title buttons (for hover hit-testing)
+    buttons: Vec<Retained<NSButton>>,      // the VISIBLE top-level title buttons (for hover hit-testing)
+    overflow_from: Option<usize>,          // model index where overflowed (»-button) menus begin
+    win_width: f64,                        // last focused-window width (drives the overflow layout)
+    laid_out_width: f64,                   // window width the current bar layout was fitted to
     open_menu: Option<Retained<NSMenu>>,   // the currently-tracking dropdown (to cancel on switch)
     pending_switch: Option<usize>,         // peer title to open after cancelling the current one
     menu_left: f64,                         // AX x of the real menus' left edge (Apple menu); per-display
@@ -190,6 +194,7 @@ struct Inner {
     config: Config,                         // live user settings (timings); edited via the settings pane
     tick_timer: Option<Retained<NSTimer>>,  // the reconciliation timer (recreated when poll rate changes)
     last_menu_check: Option<Instant>,       // last periodic menu re-read (picks up late-populating menus)
+    hotkey: Option<crate::hotkey::HotkeyRegistration>, // global command-palette hotkey (RAII)
 }
 
 pub struct Ivars {
@@ -222,6 +227,20 @@ define_class!(
         fn item_clicked_(&self, sender: Option<&AnyObject>) {
             if let Some(b) = sender.and_then(|s| s.downcast_ref::<NSButton>()) {
                 self.on_item_clicked(b.tag() as usize);
+            }
+        }
+
+        #[unsafe(method(openOverflow:))]
+        fn open_overflow_(&self, sender: Option<&AnyObject>) {
+            if let Some(b) = sender.and_then(|s| s.downcast_ref::<NSButton>()) {
+                self.on_overflow_clicked(b);
+            }
+        }
+
+        #[unsafe(method(overflowItem:))]
+        fn overflow_item_(&self, sender: Option<&AnyObject>) {
+            if let Some(mi) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
+                self.on_overflow_item(mi.tag());
             }
         }
 
@@ -259,6 +278,9 @@ impl Controller {
             shown: false,
             highlight: None,
             buttons: Vec::new(),
+            overflow_from: None,
+            win_width: 0.0,
+            laid_out_width: 0.0,
             open_menu: None,
             pending_switch: None,
             menu_left: f64::INFINITY,
@@ -268,6 +290,7 @@ impl Controller {
             config: config::load(),
             tick_timer: None,
             last_menu_check: None,
+            hotkey: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
             inner: RefCell::new(inner),
@@ -293,6 +316,31 @@ impl Controller {
             );
             NSRunLoop::currentRunLoop().addTimer_forMode(&watcher, NSRunLoopCommonModes);
         }
+        self.register_hotkey();
+    }
+
+    /// Register the global command-palette hotkey from config (RAII guard kept in `inner.hotkey`).
+    fn register_hotkey(&self) {
+        let chord = self.ivars().inner.borrow().config.palette_hotkey;
+        let this = self.retain();
+        match crate::hotkey::HotkeyRegistration::install(chord.mods, chord.keycode, move || {
+            this.on_palette_hotkey()
+        }) {
+            Ok(reg) => self.ivars().inner.borrow_mut().hotkey = Some(reg),
+            Err(e) => eprintln!("[lintel] command-palette hotkey registration failed: {e}"),
+        }
+    }
+
+    /// The command-palette hotkey fired (on the main run loop): open the palette for the app that
+    /// is frontmost *now* (before the palette activates Lintel and steals key focus).
+    fn on_palette_hotkey(&self) {
+        let Some(pid) = frontmost_pid() else {
+            return;
+        };
+        if pid == std::process::id() as i32 {
+            return; // never target ourselves
+        }
+        crate::palette::open(self.mtm(), pid);
     }
 
     /// (Re)create the reconciliation timer at the configured poll rate, invalidating any prior one.
@@ -566,6 +614,27 @@ impl Controller {
             self.hide_all();
             return;
         }
+        // Nothing to mirror: the app exposes no menus (e.g. an accessory / LSUIElement app like
+        // Canopy has no menu bar). Don't show an empty bar. A late-loading menu is picked up by the
+        // periodic recheck (empty -> populated), which then shows the bar.
+        if self.ivars().inner.borrow().model.is_empty() {
+            self.hide_all();
+            return;
+        }
+        // Re-fit the bar to the current window width so the overflow (») button appears/disappears
+        // as the window is resized. Cheap (no AX); skipped while a dropdown is open or empty.
+        {
+            let relayout = {
+                let inner = self.ivars().inner.borrow();
+                (size.width - inner.laid_out_width).abs() > 1.0
+                    && inner.open_top.is_none()
+                    && !inner.model.is_empty()
+            };
+            if relayout {
+                self.layout_bar(size.width);
+            }
+            self.ivars().inner.borrow_mut().win_width = size.width;
+        }
         // Hide only when the bar would sit near the actual system MENUS: vertically within the
         // menu-bar strip AND horizontally within MENU_HIDE_FACTOR x the menus' length of where they
         // start. A window off to the side (bar over empty menu-bar space) still shows and overlaps.
@@ -707,7 +776,6 @@ impl Controller {
 
     /// Read the app's menu bar (top-level + first-level) and rebuild the bar's buttons.
     fn rebuild_bar_content(&self, pid: i32) {
-        let mtm = self.mtm();
         let app = ax::app_element(pid);
         ax::set_timeout(&app, 1.0);
 
@@ -772,33 +840,101 @@ impl Controller {
             );
         }
 
-        // Build a fresh acrylic content view with one button per top-level menu.
-        let (effect, stack, highlight) = make_content(mtm);
-        let (font, bold) = menu_bar_fonts(mtm);
-        let target: &AnyObject = self;
-        let mut buttons = Vec::with_capacity(model.len());
-        for (i, top) in model.iter().enumerate() {
-            // The app menu (first item, after the Apple menu is dropped) is bold, like macOS.
-            let f: &NSFont = if i == 0 { &bold } else { &font };
-            let btn = make_button(mtm, &top.title, f, true, target, sel!(topClicked:), i as isize);
-            stack.addArrangedSubview(&btn);
-            buttons.push(btn);
-        }
-        // Width fits the titles; height is the system menu bar plus a little vertical margin.
-        let fit = stack.fittingSize();
-        let size = CGSize::new(fit.width, menu_bar_height() + BAR_V_MARGIN);
-
-        let bar = {
+        let avail = {
             let mut inner = self.ivars().inner.borrow_mut();
-            inner.bar_size = size;
             inner.model = model;
             inner.current_pid = pid;
             inner.open_top = None;
-            inner.last_frame = None; // bar size changed; reposition on the next tick
-            inner.highlight = Some(highlight);
-            inner.buttons = buttons;
+            inner.last_frame = None; // bar size may change; reposition on the next tick
             inner.menu_left = menu_left;
             inner.menu_right = menu_right;
+            // Lay out to the known window width; INFINITY (no clamp) until reconcile learns it.
+            if inner.win_width > 1.0 { inner.win_width } else { f64::INFINITY }
+        };
+        self.layout_bar(avail);
+    }
+
+    /// Build the bar's content view + top-level buttons from the stored model, fitting into `avail`
+    /// px of window width. When the menus don't all fit, show as many as do plus a `»` overflow
+    /// button that opens the rest as submenus. Cheap (no AX) — re-run when the window width changes.
+    fn layout_bar(&self, avail: f64) {
+        let mtm = self.mtm();
+        let (effect, stack, highlight) = make_content(mtm);
+        let (font, bold) = menu_bar_fonts(mtm);
+        let target: &AnyObject = self;
+
+        let titles: Vec<(String, bool)> = {
+            let inner = self.ivars().inner.borrow();
+            inner
+                .model
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (t.title.clone(), i == 0)) // first (app) menu is bold, like macOS
+                .collect()
+        };
+        let n = titles.len();
+
+        // Build + measure each top-level button (tag = model index).
+        let mut btns = Vec::with_capacity(n);
+        let mut widths = Vec::with_capacity(n);
+        for (title, is_first) in &titles {
+            let f: &NSFont = if *is_first { &bold } else { &font };
+            let btn =
+                make_button(mtm, title, f, true, target, sel!(topClicked:), btns.len() as isize);
+            widths.push(btn.fittingSize().width);
+            btns.push(btn);
+        }
+
+        // Natural width of all buttons; if it exceeds the window, fit a prefix + overflow button.
+        let natural = 2.0 * BAR_EDGE
+            + widths.iter().sum::<f64>()
+            + ITEM_SPACING * (n.saturating_sub(1)) as f64;
+        let mut visible = n;
+        let mut overflow_from = None;
+        let mut overflow_btn = None;
+        if n > 0 && natural > avail {
+            let ov = make_button(mtm, OVERFLOW_LABEL, &font, true, target, sel!(openOverflow:), -1);
+            let mut used = 2.0 * BAR_EDGE + ov.fittingSize().width + ITEM_SPACING;
+            let mut k = 0usize;
+            for w in &widths {
+                let add = w + if k > 0 { ITEM_SPACING } else { 0.0 };
+                if used + add <= avail {
+                    used += add;
+                    k += 1;
+                } else {
+                    break;
+                }
+            }
+            visible = k;
+            overflow_from = Some(k);
+            overflow_btn = Some(ov);
+        }
+        if std::env::var_os("LINTEL_DEBUG").is_some() {
+            eprintln!(
+                "[dbg] layout: avail={avail:.0} natural={natural:.0} n={n} visible={visible} overflow={}",
+                overflow_from.is_some()
+            );
+        }
+
+        let mut buttons = Vec::with_capacity(visible);
+        for btn in btns.into_iter().take(visible) {
+            stack.addArrangedSubview(&btn);
+            buttons.push(btn);
+        }
+        if let Some(ov) = overflow_btn {
+            stack.addArrangedSubview(&ov);
+        }
+
+        // Height is the system menu bar plus a little vertical margin; width fits the shown buttons.
+        let fit = stack.fittingSize();
+        let size = CGSize::new(fit.width, menu_bar_height() + BAR_V_MARGIN);
+        let bar = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.bar_size = size;
+            inner.highlight = Some(highlight);
+            inner.buttons = buttons;
+            inner.overflow_from = overflow_from;
+            inner.laid_out_width = avail;
             inner.bar.clone()
         };
         bar.setContentView(Some(&effect));
@@ -936,6 +1072,75 @@ impl Controller {
                 .open_top
                 .and_then(|t| inner.model.get(t))
                 .and_then(|top| top.items.get(j))
+                .map(|it| it.el.clone())
+        };
+        if let Some(el) = el {
+            let err = ax::press(&el);
+            println!("[lintel] AXPress -> {err:?}");
+        }
+    }
+
+    /// The `»` overflow button was clicked: pop up a menu whose items are the overflowed top-level
+    /// menus, each carrying its own items as a submenu. Leaf items encode (top, item) in their tag.
+    fn on_overflow_clicked(&self, button: &NSButton) {
+        let mtm = self.mtm();
+        let menu = NSMenu::new(mtm);
+        menu.setAutoenablesItems(false);
+        let target: &AnyObject = self;
+        {
+            let inner = self.ivars().inner.borrow();
+            let Some(start) = inner.overflow_from else {
+                return;
+            };
+            for top_idx in start..inner.model.len() {
+                let top = &inner.model[top_idx];
+                let parent = unsafe {
+                    menu.addItemWithTitle_action_keyEquivalent(
+                        &NSString::from_str(&top.title),
+                        None,
+                        &NSString::from_str(""),
+                    )
+                };
+                let submenu = NSMenu::new(mtm);
+                submenu.setAutoenablesItems(false);
+                for (j, it) in top.items.iter().enumerate() {
+                    if it.is_sep {
+                        submenu.addItem(&NSMenuItem::separatorItem(mtm));
+                        continue;
+                    }
+                    let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
+                    let item = unsafe {
+                        submenu.addItemWithTitle_action_keyEquivalent(
+                            &NSString::from_str(&it.title),
+                            Some(sel!(overflowItem:)),
+                            &NSString::from_str(key),
+                        )
+                    };
+                    if let Some(s) = &it.shortcut {
+                        item.setKeyEquivalentModifierMask(s.mods);
+                    }
+                    item.setEnabled(it.enabled);
+                    item.setTag(((top_idx as isize) << 16) | (j as isize)); // (top<<16)|item
+                    unsafe { item.setTarget(Some(target)) };
+                }
+                parent.setSubmenu(Some(&submenu));
+            }
+        }
+        let bar = self.ivars().inner.borrow().bar.clone();
+        let btn = bar.convertRectToScreen(button.convertRect_toView(button.bounds(), None));
+        let loc = NSPoint::new(btn.origin.x + MENU_LEFT_ADJUST, bar.frame().origin.y - MENU_DROP);
+        menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
+    }
+
+    /// A leaf item of the overflow menu was chosen; its tag encodes `(top << 16) | item`.
+    fn on_overflow_item(&self, tag: isize) {
+        let (top, item) = ((tag >> 16) as usize, (tag & 0xFFFF) as usize);
+        let el = {
+            let inner = self.ivars().inner.borrow();
+            inner
+                .model
+                .get(top)
+                .and_then(|t| t.items.get(item))
                 .map(|it| it.el.clone())
         };
         if let Some(el) = el {

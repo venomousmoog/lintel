@@ -11,6 +11,27 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// A global-hotkey chord: Carbon modifier mask + virtual keycode. Default ⌘⇧M
+/// (cmdKey 0x0100 | shiftKey 0x0200 = 0x0300; kVK_ANSI_M = 0x2E).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HotkeyChord {
+    pub mods: u32,
+    pub keycode: u32,
+}
+
+impl Default for HotkeyChord {
+    fn default() -> Self {
+        HotkeyChord {
+            mods: 0x0100 | 0x0200, // ⌘⇧
+            keycode: 0x2E,         // M
+        }
+    }
+}
+
+fn default_palette_hotkey() -> HotkeyChord {
+    HotkeyChord::default()
+}
+
 fn default_fade_ms() -> u32 {
     200
 }
@@ -36,6 +57,9 @@ pub struct Config {
     /// Launch Lintel automatically at login (via `SMAppService`).
     #[serde(default)]
     pub launch_at_login: bool,
+    /// Global hotkey that opens the command palette (menu type-ahead search).
+    #[serde(default = "default_palette_hotkey")]
+    pub palette_hotkey: HotkeyChord,
 }
 
 impl Default for Config {
@@ -45,6 +69,7 @@ impl Default for Config {
             settle_ms: default_settle_ms(),
             poll_hz: default_poll_hz(),
             launch_at_login: false,
+            palette_hotkey: HotkeyChord::default(),
         }
     }
 }
@@ -143,6 +168,7 @@ mod tests {
             settle_ms: 90,
             poll_hz: 45,
             launch_at_login: true,
+            palette_hotkey: HotkeyChord { mods: 0x0100, keycode: 0x23 },
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: Config = toml::from_str(&text).unwrap();
@@ -180,6 +206,7 @@ mod tests {
             settle_ms: 99_999,
             poll_hz: 0,
             launch_at_login: false,
+            palette_hotkey: HotkeyChord::default(),
         }
         .sanitized();
         assert_eq!(c.fade_ms, 2000);

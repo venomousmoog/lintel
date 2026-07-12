@@ -13,8 +13,10 @@
 
 mod ax;
 mod config;
+mod hotkey;
 mod observer;
 mod overlay;
+mod palette;
 mod settings;
 
 use objc2::MainThreadMarker;

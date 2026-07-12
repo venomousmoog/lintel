@@ -22,7 +22,7 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
 
-use crate::config::Config;
+use crate::config::{Config, HotkeyChord};
 
 /// Register (or clear) Lintel as a login item via `SMAppService` (macOS 13+). Only takes
 /// effect from a signed `.app` bundle; from `make dev` it logs a harmless error.
@@ -194,6 +194,15 @@ pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn)
         ),
     );
 
+    add(
+        &advanced,
+        &row(
+            mtm,
+            "Command palette",
+            &make_label(mtm, &hotkey_display(cfg.palette_hotkey)),
+        ),
+    );
+
     tabs.addTabViewItem(&tab_item(mtm, "Advanced", &advanced));
 
     if let Some(content) = window.contentView() {
@@ -290,6 +299,47 @@ fn slider_row(
 
 fn make_label(mtm: MainThreadMarker, text: &str) -> Retained<NSTextField> {
     NSTextField::labelWithString(&NSString::from_str(text), mtm)
+}
+
+/// A `[label]   [control]` horizontal row.
+fn row(mtm: MainThreadMarker, label: &str, control: &NSView) -> Retained<NSStackView> {
+    let h = NSStackView::new(mtm);
+    h.setOrientation(NSUserInterfaceLayoutOrientation::Horizontal);
+    h.setSpacing(8.0);
+    add(&h, &make_label(mtm, label));
+    add(&h, control);
+    h
+}
+
+/// Human-readable chord, e.g. "⌘⇧M" (Carbon modifier mask + virtual keycode).
+fn hotkey_display(c: HotkeyChord) -> String {
+    let mut s = String::new();
+    if c.mods & 0x1000 != 0 {
+        s.push('⌃');
+    }
+    if c.mods & 0x0800 != 0 {
+        s.push('⌥');
+    }
+    if c.mods & 0x0200 != 0 {
+        s.push('⇧');
+    }
+    if c.mods & 0x0100 != 0 {
+        s.push('⌘');
+    }
+    s.push_str(keycode_name(c.keycode));
+    s
+}
+
+/// Display name for a virtual keycode (letters + a few common keys; `?` otherwise).
+fn keycode_name(k: u32) -> &'static str {
+    match k {
+        0x00 => "A", 0x0B => "B", 0x08 => "C", 0x02 => "D", 0x0E => "E", 0x03 => "F", 0x05 => "G",
+        0x04 => "H", 0x22 => "I", 0x26 => "J", 0x28 => "K", 0x25 => "L", 0x2E => "M", 0x2D => "N",
+        0x1F => "O", 0x23 => "P", 0x0C => "Q", 0x0F => "R", 0x01 => "S", 0x11 => "T", 0x20 => "U",
+        0x09 => "V", 0x0D => "W", 0x07 => "X", 0x10 => "Y", 0x06 => "Z",
+        0x31 => "Space", 0x24 => "Return", 0x30 => "Tab", 0x35 => "Esc",
+        _ => "?",
+    }
 }
 
 fn checkbox(

@@ -21,6 +21,7 @@ pub mod names {
     pub const AX_MENU_BAR: &str = "AXMenuBar";
     pub const AX_CHILDREN: &str = "AXChildren";
     pub const AX_TITLE: &str = "AXTitle";
+    pub const AX_HELP: &str = "AXHelp"; // help tag / tooltip text (often empty on menu items)
     pub const AX_SUBROLE: &str = "AXSubrole";
     pub const AX_ENABLED: &str = "AXEnabled";
     pub const AX_MENU_ITEM_CMD_CHAR: &str = "AXMenuItemCmdChar";

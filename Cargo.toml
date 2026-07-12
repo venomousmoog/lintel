@@ -19,7 +19,7 @@ features = ["SMAppService"]
 version = "0.3.2"
 features = [
     "NSString", "NSArray", "NSDictionary", "NSAttributedString", "NSTimer", "NSDate",
-    "NSGeometry", "objc2-core-foundation",
+    "NSGeometry", "NSNotification", "objc2-core-foundation",
 ]
 
 [dependencies.objc2-core-graphics]
@@ -36,6 +36,7 @@ features = [
     "NSFont", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSImage",
     "NSAttributedString", "NSAnimation", "NSAnimationContext", "NSWorkspace",
     "NSRunningApplication", "NSTabView", "NSTabViewItem", "NSSlider", "NSTextField",
+    "NSText", "NSTextView", "NSProgressIndicator", "NSParagraphStyle", "NSCell",
     "objc2-core-foundation", "objc2-core-graphics", "objc2-quartz-core", "block2",
 ]
 
