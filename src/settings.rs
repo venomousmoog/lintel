@@ -22,11 +22,35 @@ use objc2_app_kit::{
     NSPopUpButton, NSSlider, NSStackView, NSTabView, NSTabViewItem, NSTextField,
     NSUserInterfaceLayoutOrientation, NSView, NSWindow, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString};
+use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSUserDefaults};
 use block2::RcBlock;
 use core::ptr::NonNull;
 
 use crate::config::{Config, HotkeyChord, Theme};
+
+/// Name under which the settings window's frame is autosaved (defaults key "NSWindow Frame <this>").
+const AUTOSAVE_NAME: &str = "LintelSettings";
+
+/// Read the raw window frame Cocoa autosaved under `NSWindow Frame <name>`, parsing the leading
+/// `x y w h` fields. We read it directly instead of `setFrameUsingName:` to skip that method's
+/// `constrainFrameRect:toScreen:`, which remaps negative-origin frames (monitors left of / below
+/// the primary) back onto the main screen. `None` if nothing was ever saved or the value is junk.
+fn saved_window_frame(autosave_name: &str) -> Option<NSRect> {
+    let key = NSString::from_str(&format!("NSWindow Frame {autosave_name}"));
+    let value = NSUserDefaults::standardUserDefaults().stringForKey(&key)?;
+    parse_frame(&value.to_string())
+}
+
+/// Parse a Cocoa autosaved frame string — `"x y w h screenX screenY screenW screenH"` — into the
+/// window rect (the leading four fields). The trailing screen descriptor is ignored on purpose.
+fn parse_frame(s: &str) -> Option<NSRect> {
+    let mut nums = s.split_whitespace();
+    let x = nums.next()?.parse::<f64>().ok()?;
+    let y = nums.next()?.parse::<f64>().ok()?;
+    let w = nums.next()?.parse::<f64>().ok()?;
+    let h = nums.next()?.parse::<f64>().ok()?;
+    Some(NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)))
+}
 
 /// Apply the app appearance for `theme` (System = follow the OS). Affects all Lintel windows.
 pub fn apply_theme(mtm: MainThreadMarker, theme: Theme) {
@@ -360,13 +384,23 @@ pub fn open(mtm: MainThreadMarker, read: Rc<dyn Fn() -> Config>, write: WriteFn)
     }
 
     // Reopen the window where it was last left (handy while iterating with `--settings`, so it
-    // returns to your chosen monitor/spot instead of centering on the active screen). Cocoa's
-    // frame autosave persists via `cfprefsd`, so it survives the `killall` on restart — a
-    // `windowWillClose:` hook wouldn't, since SIGTERM skips it. Center only on first-ever run.
-    let autosave = NSString::from_str("LintelSettings");
-    window.setFrameAutosaveName(&autosave); // save position/size on every future move + resize
-    if !window.setFrameUsingName(&autosave) {
-        window.center();
+    // returns to your chosen monitor/spot instead of centering on the active screen). We keep
+    // `setFrameAutosaveName:` for *saving* — it writes the true frame on every move/resize and
+    // persists via `cfprefsd`, so it survives the `killall` on restart (a `windowWillClose:` hook
+    // wouldn't, since SIGTERM skips it) — but restore the frame ourselves. `setFrameUsingName:`
+    // runs the saved frame through `constrainFrameRect:toScreen:` against the main screen, which
+    // remaps a window last placed on a monitor left of / below the primary (negative global
+    // coords) back onto the primary (restored_x == saved_x + primaryWidth). `setFrame:display:`
+    // does no constraining. Center on first-ever run, or if the saved monitor is now unplugged.
+    window.setFrameAutosaveName(&NSString::from_str(AUTOSAVE_NAME));
+    match saved_window_frame(AUTOSAVE_NAME) {
+        Some(rect) => {
+            window.setFrame_display(rect, true);
+            if window.screen().is_none() {
+                window.center();
+            }
+        }
+        None => window.center(),
     }
     // Accessory apps must activate to bring a regular window frontmost.
     #[allow(deprecated)]
@@ -544,5 +578,28 @@ fn is_on(button: &NSButton) -> bool {
 fn set_label(slot: &LabelSlot, text: &str) {
     if let Some(lbl) = slot.borrow().as_ref() {
         lbl.setStringValue(&NSString::from_str(text));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_frame;
+
+    #[test]
+    fn parses_negative_origin_frame() {
+        // A window last placed on a monitor left of the primary: negative x. The trailing screen
+        // descriptor is ignored; the negative origin must be preserved verbatim (not remapped).
+        let r = parse_frame("-996 200 460 332 -3360 0 2560 1440").unwrap();
+        assert_eq!(r.origin.x, -996.0);
+        assert_eq!(r.origin.y, 200.0);
+        assert_eq!(r.size.width, 460.0);
+        assert_eq!(r.size.height, 332.0);
+    }
+
+    #[test]
+    fn rejects_junk_or_short() {
+        assert!(parse_frame("").is_none());
+        assert!(parse_frame("1 2 3").is_none()); // fewer than 4 fields
+        assert!(parse_frame("a b c d").is_none()); // non-numeric
     }
 }
