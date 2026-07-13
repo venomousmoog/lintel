@@ -1014,6 +1014,27 @@ impl Controller {
     /// Open the top-level menu at `first`, then keep switching whenever the hover watcher
     /// (`check_switch`) cancels the current menu because the mouse moved to a peer title —
     /// giving system-style menu-bar tracking. `NSMenu` dismisses on click-outside natively.
+    /// Recolor the top-level title at `idx` for the open/closed state: white while its menu is open
+    /// (inverted over the solid selection pill, matching the dropdown/palette), else the adaptive
+    /// label color. `idx` indexes both the visible `buttons` and the `model` (they're aligned).
+    fn set_title_highlighted(&self, idx: usize, on: bool) {
+        let (button, title, is_first) = {
+            let inner = self.ivars().inner.borrow();
+            match (inner.buttons.get(idx), inner.model.get(idx)) {
+                (Some(b), Some(t)) => (b.clone(), t.title.clone(), idx == 0),
+                _ => return,
+            }
+        };
+        let (font, bold) = menu_bar_fonts(self.mtm());
+        let f: &NSFont = if is_first { &bold } else { &font };
+        let color = if on {
+            NSColor::whiteColor()
+        } else {
+            NSColor::labelColor()
+        };
+        button.setAttributedTitle(&title_attr(&title, f, &color));
+    }
+
     fn open_menu_at(&self, first: usize) {
         let mtm = self.mtm();
         let mut idx = first;
@@ -1060,12 +1081,14 @@ impl Controller {
                 ));
                 hl.setHidden(false);
             }
+            self.set_title_highlighted(idx, true); // invert the title text over the selection pill
 
             menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None); // blocks (modal)
 
             if let Some(hl) = &hl {
                 hl.setHidden(true);
             }
+            self.set_title_highlighted(idx, false);
             self.ivars().inner.borrow_mut().open_menu = None;
 
             match self.ivars().inner.borrow_mut().pending_switch.take() {
@@ -1338,7 +1361,9 @@ fn make_content(
     Retained<NSView>,
 ) {
     let effect = NSVisualEffectView::new(mtm);
-    effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
+    // The same material macOS uses for menus, so the bar's translucency/tint matches the dropdowns
+    // it spawns (lighter in light mode, darker in dark) instead of the darker HUD material.
+    effect.setMaterial(NSVisualEffectMaterial::Menu);
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
     effect.setState(NSVisualEffectState::Active);
     effect.setWantsLayer(true);
@@ -1352,10 +1377,9 @@ fn make_content(
     let highlight = NSView::initWithFrame(NSView::alloc(mtm), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)));
     highlight.setWantsLayer(true);
     if let Some(layer) = highlight.layer() {
-        // A slight tint of the system accent color.
-        let cg = NSColor::controlAccentColor()
-            .colorWithAlphaComponent(0.25)
-            .CGColor();
+        // Solid native selection background (same as the dropdown/palette selection), appearance-
+        // adaptive; the active title's text flips to white over it for the inverted look.
+        let cg = NSColor::selectedContentBackgroundColor().CGColor();
         layer.setBackgroundColor(Some(&cg));
         layer.setCornerRadius(CORNER_RADIUS);
     }
@@ -1390,19 +1414,18 @@ fn make_button(
     let btn =
         unsafe { NSButton::buttonWithTitle_target_action(&ns, Some(target), Some(action), mtm) };
     btn.setBordered(false);
-    // Opaque black title (an attributed title overrides the vibrancy view's text blending, which
-    // otherwise greys the text out).
-    btn.setAttributedTitle(&black_title(title, font));
+    // Explicit foreground (labelColor) so the acrylic vibrancy doesn't grey the text out; labelColor
+    // adapts to light/dark. The active title is re-colored white by `set_title_highlighted`.
+    btn.setAttributedTitle(&title_attr(title, font, &NSColor::labelColor()));
     btn.setEnabled(enabled);
     btn.setTag(tag);
     btn
 }
 
-/// An attributed string that renders `text` in opaque black at `font` (used for the bar titles so
-/// they don't get vibrancy-blended by the acrylic background).
-fn black_title(text: &str, font: &NSFont) -> Retained<NSAttributedString> {
-    let color = NSColor::colorWithWhite_alpha(0.0, 1.0); // opaque black
-    let color_obj: &AnyObject = &color;
+/// An attributed string rendering `text` at `font` in `color`. Bar titles set an explicit foreground
+/// so the acrylic vibrancy doesn't grey them out (`labelColor` normally, white while selected).
+fn title_attr(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
+    let color_obj: &AnyObject = color;
     let font_obj: &AnyObject = font;
     let attrs = NSDictionary::from_slices(
         &[
