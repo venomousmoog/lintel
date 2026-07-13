@@ -96,7 +96,10 @@ fn cmd_read() {
     }
 }
 
-fn cmd_press(top: &str, item: &str) {
+/// Resolve an N-level menu `path` (top menu, item, then any nested submenu items) against the
+/// frontmost app's live tree and `AXPress` the leaf — the same walk `palette::fire` uses, exposed
+/// for diagnostics (e.g. `lintel press View "Sort By" Name`).
+fn cmd_press(path: &[String]) {
     if !ensure_trust() {
         std::process::exit(1);
     }
@@ -104,7 +107,11 @@ fn cmd_press(top: &str, item: &str) {
         eprintln!("No frontmost application.");
         return;
     };
-    println!("Pressing {top} > {item} in {name} (pid {pid})");
+    let Some((first, rest)) = path.split_first() else {
+        eprintln!("usage: lintel press \"<TopMenu>\" \"<Item>\" [\"<Subitem>\" …]");
+        return;
+    };
+    println!("Pressing {} in {name} (pid {pid})", path.join(" > "));
 
     let app = app_element(pid);
     set_timeout(&app, 2.0);
@@ -112,25 +119,27 @@ fn cmd_press(top: &str, item: &str) {
         eprintln!("No AXMenuBar.");
         return;
     };
-
-    for it in children(&menubar) {
-        if attr_string(&it, names::AX_TITLE).as_deref() != Some(top) {
-            continue;
-        }
-        let Some(menu) = children(&it).into_iter().next() else {
-            continue;
+    let mut node = children(&menubar)
+        .into_iter()
+        .find(|t| attr_string(t, names::AX_TITLE).as_deref() == Some(first.as_str()));
+    for comp in rest {
+        let Some(n) = node.take() else {
+            break;
         };
-        for mi in children(&menu) {
-            if attr_string(&mi, names::AX_TITLE).as_deref() == Some(item) {
-                match press(&mi) {
-                    AXError::Success => println!("OK (AXPress fired)"),
-                    err => eprintln!("AXPress -> {err:?}"),
-                }
-                return;
-            }
-        }
+        let Some(menu) = children(&n).into_iter().next() else {
+            break;
+        };
+        node = children(&menu)
+            .into_iter()
+            .find(|it| attr_string(it, names::AX_TITLE).as_deref() == Some(comp.as_str()));
     }
-    eprintln!("Item '{top} > {item}' not found.");
+    match node {
+        Some(leaf) => match press(&leaf) {
+            AXError::Success => println!("OK (AXPress fired)"),
+            err => eprintln!("AXPress -> {err:?}"),
+        },
+        None => eprintln!("Path '{}' not found.", path.join(" > ")),
+    }
 }
 
 /// When launched without a controlling terminal (e.g. via `open Lintel.app`), tee stdout/stderr
@@ -327,10 +336,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("run") | None => cmd_run(open_settings), // default (incl. the .app bundle)
         Some("watch") => cmd_watch(),
-        Some("press") => match (args.get(2), args.get(3)) {
-            (Some(top), Some(item)) => cmd_press(top, item),
-            _ => eprintln!("usage: lintel press \"<TopMenu>\" \"<Item>\""),
-        },
+        Some("press") if args.len() >= 4 => cmd_press(&args[2..]),
+        Some("press") => eprintln!("usage: lintel press \"<TopMenu>\" \"<Item>\" [\"<Subitem>\" …]"),
         Some("read") => cmd_read(),
         Some("diag") => cmd_diag(args.get(2).map(String::as_str)),
         Some(s) if s.starts_with("--") => cmd_run(open_settings), // e.g. `open --args --settings`

@@ -70,14 +70,89 @@ struct Shortcut {
 }
 struct ItemEntry {
     title: String,
-    el: CFRetained<AXUIElement>,
     is_sep: bool,
     enabled: bool,
+    has_submenu: bool, // opens a submenu (expand on hover) rather than firing an action
     shortcut: Option<Shortcut>,
 }
 struct TopMenu {
     title: String,
     items: Vec<ItemEntry>,
+}
+
+/// Field separator used to pack a menu item's full title path into its `representedObject` (leaf
+/// items) or a submenu's title (submenu parents). A control char that never occurs in a menu title.
+const PATH_SEP: char = '\u{1f}';
+
+fn join_path(path: &[String]) -> String {
+    path.join(PATH_SEP.encode_utf8(&mut [0u8; 4]))
+}
+fn split_path(s: &str) -> Vec<String> {
+    if s.is_empty() {
+        return Vec::new();
+    }
+    s.split(PATH_SEP).map(str::to_string).collect()
+}
+
+/// Read one level of a menu's items (title, enabled, shortcut, and whether the item opens a
+/// submenu). Shared by the eager top-level read and lazy submenu population. `menu` is an AXMenu.
+fn read_items(menu: &AXUIElement) -> Vec<ItemEntry> {
+    ax::children(menu)
+        .into_iter()
+        .map(|mi| {
+            let t = ax::attr_string(&mi, names::AX_TITLE).unwrap_or_default();
+            let enabled = ax::attr_bool(&mi, names::AX_ENABLED).unwrap_or(true);
+            let shortcut = ax::attr_string(&mi, names::AX_MENU_ITEM_CMD_CHAR)
+                .filter(|c| !c.is_empty())
+                .map(|c| Shortcut {
+                    key: c.to_lowercase(),
+                    mods: ax_mods_to_ns(
+                        ax::attr_i64(&mi, names::AX_MENU_ITEM_CMD_MODIFIERS).unwrap_or(0),
+                    ),
+                });
+            // A submenu parent exposes a single AXMenu child; a leaf (or separator) has none.
+            let has_submenu = !t.is_empty() && !ax::children(&mi).is_empty();
+            ItemEntry {
+                is_sep: t.is_empty(),
+                enabled,
+                has_submenu,
+                shortcut,
+                title: t,
+            }
+        })
+        .collect()
+}
+
+/// Resolve `path` (top-menu title, then submenu titles) against the app's live tree and read the
+/// items of the menu it names — the last component is the submenu-parent whose contents we return.
+/// Empty if the path no longer resolves (the app rebuilt or the menu is gone).
+fn read_menu_at_path(pid: i32, path: &[String]) -> Vec<ItemEntry> {
+    let Some((first, rest)) = path.split_first() else {
+        return Vec::new();
+    };
+    let app = ax::app_element(pid);
+    ax::set_timeout(&app, 1.0);
+    let Some(menubar) = ax::attr_element(&app, names::AX_MENU_BAR) else {
+        return Vec::new();
+    };
+    let mut node = ax::children(&menubar)
+        .into_iter()
+        .find(|t| ax::attr_string(t, names::AX_TITLE).as_deref() == Some(first.as_str()));
+    for comp in rest {
+        let Some(n) = node else {
+            return Vec::new();
+        };
+        let Some(menu) = ax::children(&n).into_iter().next() else {
+            return Vec::new();
+        };
+        node = ax::children(&menu)
+            .into_iter()
+            .find(|it| ax::attr_string(it, names::AX_TITLE).as_deref() == Some(comp.as_str()));
+    }
+    match node.and_then(|n| ax::children(&n).into_iter().next()) {
+        Some(menu) => read_items(&menu),
+        None => Vec::new(),
+    }
 }
 
 /// Translate the AX menu-item modifier bitmask (Shift=1, Option=2, Control=4, NoCommand=8;
@@ -227,7 +302,7 @@ define_class!(
         fn item_clicked_(&self, sender: Option<&AnyObject>) {
             // The sender of a menu item's action is the NSMenuItem itself, not a button.
             if let Some(mi) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
-                self.on_item_clicked(mi.tag() as usize);
+                self.on_item_clicked(mi);
             }
         }
 
@@ -238,11 +313,10 @@ define_class!(
             }
         }
 
-        #[unsafe(method(overflowItem:))]
-        fn overflow_item_(&self, sender: Option<&AnyObject>) {
-            if let Some(mi) = sender.and_then(|s| s.downcast_ref::<NSMenuItem>()) {
-                self.on_overflow_item(mi.tag());
-            }
+        // NSMenuDelegate: a submenu is about to display -> populate it lazily from the live tree.
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update_(&self, menu: &NSMenu) {
+            self.on_menu_needs_update(menu);
         }
 
         #[unsafe(method(checkSwitch:))]
@@ -822,31 +896,7 @@ impl Controller {
                 let items = ax::children(&top)
                     .into_iter()
                     .next() // the single AXMenu child
-                    .map(|menu| {
-                        ax::children(&menu)
-                            .into_iter()
-                            .map(|mi| {
-                                let t = ax::attr_string(&mi, names::AX_TITLE).unwrap_or_default();
-                                let enabled = ax::attr_bool(&mi, names::AX_ENABLED).unwrap_or(true);
-                                let shortcut = ax::attr_string(&mi, names::AX_MENU_ITEM_CMD_CHAR)
-                                    .filter(|c| !c.is_empty())
-                                    .map(|c| Shortcut {
-                                        key: c.to_lowercase(),
-                                        mods: ax_mods_to_ns(
-                                            ax::attr_i64(&mi, names::AX_MENU_ITEM_CMD_MODIFIERS)
-                                                .unwrap_or(0),
-                                        ),
-                                    });
-                                ItemEntry {
-                                    is_sep: t.is_empty(),
-                                    enabled,
-                                    shortcut,
-                                    title: t,
-                                    el: mi,
-                                }
-                            })
-                            .collect()
-                    })
+                    .map(|menu| read_items(&menu))
                     .unwrap_or_default();
                 model.push(TopMenu { title, items });
             }
@@ -971,32 +1021,12 @@ impl Controller {
             // Build the native NSMenu for `idx` and grab its title button (for positioning).
             let menu = NSMenu::new(mtm);
             menu.setAutoenablesItems(false); // honor our explicit per-item enabled state
-            let target: &AnyObject = self;
             let button = {
                 let inner = self.ivars().inner.borrow();
                 let Some(top) = inner.model.get(idx) else {
                     return;
                 };
-                for (j, it) in top.items.iter().enumerate() {
-                    if it.is_sep {
-                        menu.addItem(&NSMenuItem::separatorItem(mtm));
-                        continue;
-                    }
-                    let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
-                    let item = unsafe {
-                        menu.addItemWithTitle_action_keyEquivalent(
-                            &NSString::from_str(&it.title),
-                            Some(sel!(itemClicked:)),
-                            &NSString::from_str(key),
-                        )
-                    };
-                    if let Some(s) = &it.shortcut {
-                        item.setKeyEquivalentModifierMask(s.mods);
-                    }
-                    item.setEnabled(it.enabled);
-                    item.setTag(j as isize);
-                    unsafe { item.setTarget(Some(target)) };
-                }
+                self.build_menu_items(&menu, std::slice::from_ref(&top.title), &top.items);
                 inner.buttons.get(idx).cloned()
             };
             let Some(button) = button else {
@@ -1080,52 +1110,88 @@ impl Controller {
         }
     }
 
-    fn on_item_clicked(&self, j: usize) {
-        let (pid, path, el) = {
-            let inner = self.ivars().inner.borrow();
-            let pid = inner.current_pid;
-            let entry = inner
-                .open_top
-                .and_then(|t| inner.model.get(t))
-                .and_then(|top| top.items.get(j).map(|it| (top, it)));
-            match entry {
-                Some((top, it)) => (
-                    pid,
-                    vec![top.title.clone(), it.title.clone()],
-                    it.el.clone(),
-                ),
-                None => return,
+    /// Populate `menu` with `items` under `base_path` (the path of `menu` itself: `[top]` for a top
+    /// dropdown, `[top, sub, …]` for a submenu). Leaves fire via `itemClicked:` carrying their full
+    /// title path in `representedObject`; submenu parents get an empty child menu whose contents this
+    /// same routine fills lazily on `menuNeedsUpdate:` (so slow menus like Services aren't read until
+    /// hovered, and dynamic ones re-read each open). Firing re-resolves the path — no cached handles.
+    fn build_menu_items(&self, menu: &NSMenu, base_path: &[String], items: &[ItemEntry]) {
+        let mtm = self.mtm();
+        let target: &AnyObject = self;
+        for it in items {
+            if it.is_sep {
+                menu.addItem(&NSMenuItem::separatorItem(mtm));
+                continue;
             }
-        };
-        self.fire_menu(pid, &path, &el);
+            let mut path = base_path.to_vec();
+            path.push(it.title.clone());
+            if it.has_submenu {
+                let item = unsafe {
+                    menu.addItemWithTitle_action_keyEquivalent(
+                        &NSString::from_str(&it.title),
+                        None, // a submenu parent expands on hover rather than firing
+                        &NSString::from_str(""),
+                    )
+                };
+                item.setEnabled(it.enabled);
+                let submenu = NSMenu::new(mtm);
+                submenu.setAutoenablesItems(false);
+                submenu.setTitle(&NSString::from_str(&join_path(&path))); // path key for the delegate
+                unsafe {
+                    let _: () = msg_send![&*submenu, setDelegate: target];
+                }
+                item.setSubmenu(Some(&submenu));
+            } else {
+                let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
+                let item = unsafe {
+                    menu.addItemWithTitle_action_keyEquivalent(
+                        &NSString::from_str(&it.title),
+                        Some(sel!(itemClicked:)),
+                        &NSString::from_str(key),
+                    )
+                };
+                if let Some(s) = &it.shortcut {
+                    item.setKeyEquivalentModifierMask(s.mods);
+                }
+                item.setEnabled(it.enabled);
+                unsafe {
+                    item.setTarget(Some(target));
+                    item.setRepresentedObject(Some(&NSString::from_str(&join_path(&path))));
+                }
+            }
+        }
     }
 
-    /// Trigger a menu item: re-resolve its `path` against the app's live menu tree and `AXPress`
-    /// the fresh element (cached menu-item handles go stale — see `palette::fire`). Falls back to
-    /// pressing the cached element only if re-resolution can't find the item (e.g. no `AXTitle`).
-    fn fire_menu(&self, pid: i32, path: &[String], cached: &CFRetained<AXUIElement>) {
-        if crate::palette::fire(pid, path) {
+    /// A leaf menu item was chosen: read its full title path from `representedObject` and fire it by
+    /// re-resolving that path against the app's live tree (`palette::fire`), which handles any depth
+    /// and stays correct when the app rebuilt or lazily repopulated its menus.
+    fn on_item_clicked(&self, item: &NSMenuItem) {
+        let path = item
+            .representedObject()
+            .and_then(|o| o.downcast_ref::<NSString>().map(NSString::to_string))
+            .map(|s| split_path(&s))
+            .unwrap_or_default();
+        if path.is_empty() {
             return;
         }
-        tracing::debug!("fire_menu re-resolve failed for {path:?}; pressing cached element");
-        let err = ax::press(cached);
-        tracing::debug!("AXPress(cached) -> {err:?}");
+        let pid = self.ivars().inner.borrow().current_pid;
+        if !crate::palette::fire(pid, &path) {
+            tracing::debug!("menu fire could not resolve {path:?}");
+        }
     }
 
     /// The `»` overflow button was clicked: pop up a menu whose items are the overflowed top-level
-    /// menus, each carrying its own items as a submenu. Leaf items encode (top, item) in their tag.
+    /// menus, each carrying its own items as a submenu (deeper submenus expand lazily as usual).
     fn on_overflow_clicked(&self, button: &NSButton) {
         let mtm = self.mtm();
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
-        let target: &AnyObject = self;
         {
             let inner = self.ivars().inner.borrow();
             let Some(start) = inner.overflow_from else {
                 return;
             };
-            for top_idx in start..inner.model.len() {
-                let top = &inner.model[top_idx];
+            for top in &inner.model[start..] {
                 let parent = unsafe {
                     menu.addItemWithTitle_action_keyEquivalent(
                         &NSString::from_str(&top.title),
@@ -1135,26 +1201,7 @@ impl Controller {
                 };
                 let submenu = NSMenu::new(mtm);
                 submenu.setAutoenablesItems(false);
-                for (j, it) in top.items.iter().enumerate() {
-                    if it.is_sep {
-                        submenu.addItem(&NSMenuItem::separatorItem(mtm));
-                        continue;
-                    }
-                    let key = it.shortcut.as_ref().map(|s| s.key.as_str()).unwrap_or("");
-                    let item = unsafe {
-                        submenu.addItemWithTitle_action_keyEquivalent(
-                            &NSString::from_str(&it.title),
-                            Some(sel!(overflowItem:)),
-                            &NSString::from_str(key),
-                        )
-                    };
-                    if let Some(s) = &it.shortcut {
-                        item.setKeyEquivalentModifierMask(s.mods);
-                    }
-                    item.setEnabled(it.enabled);
-                    item.setTag(((top_idx as isize) << 16) | (j as isize)); // (top<<16)|item
-                    unsafe { item.setTarget(Some(target)) };
-                }
+                self.build_menu_items(&submenu, std::slice::from_ref(&top.title), &top.items);
                 parent.setSubmenu(Some(&submenu));
             }
         }
@@ -1164,22 +1211,17 @@ impl Controller {
         menu.popUpMenuPositioningItem_atLocation_inView(None, loc, None);
     }
 
-    /// A leaf item of the overflow menu was chosen; its tag encodes `(top << 16) | item`.
-    fn on_overflow_item(&self, tag: isize) {
-        let (top, item) = ((tag >> 16) as usize, (tag & 0xFFFF) as usize);
-        let (pid, path, el) = {
-            let inner = self.ivars().inner.borrow();
-            let pid = inner.current_pid;
-            let entry = inner
-                .model
-                .get(top)
-                .and_then(|t| t.items.get(item).map(|it| (t, it)));
-            match entry {
-                Some((t, it)) => (pid, vec![t.title.clone(), it.title.clone()], it.el.clone()),
-                None => return,
-            }
-        };
-        self.fire_menu(pid, &path, &el);
+    /// NSMenuDelegate: a submenu is about to display. Its title carries its path (set when we built
+    /// the parent item); re-resolve that path against the live tree and (re)fill the submenu.
+    fn on_menu_needs_update(&self, menu: &NSMenu) {
+        let path = split_path(&menu.title().to_string());
+        if path.is_empty() {
+            return;
+        }
+        let pid = self.ivars().inner.borrow().current_pid;
+        let items = read_menu_at_path(pid, &path);
+        menu.removeAllItems();
+        self.build_menu_items(menu, &path, &items);
     }
 
     /// Convert an AX window position (global top-left, y-down) to the Cocoa y of the window's top
