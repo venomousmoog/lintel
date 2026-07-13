@@ -19,7 +19,8 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message,
 };
 use objc2_app_kit::{
-    NSAnimatablePropertyContainer, NSAnimationContext, NSBackingStoreType, NSButton, NSColor,
+    NSAnimatablePropertyContainer, NSAnimationContext, NSAppearanceNameDarkAqua, NSApplication,
+    NSBackingStoreType, NSButton, NSColor,
     NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
     NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar,
     NSStatusItem, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView,
@@ -479,6 +480,7 @@ impl Controller {
         }
         if theme_changed {
             crate::settings::apply_theme(self.mtm(), cfg.theme);
+            self.recolor_titles(); // baked opaque title colors don't auto-adapt; refresh them
         }
         if hotkey_changed {
             self.register_hotkey();
@@ -1011,12 +1013,9 @@ impl Controller {
         self.open_menu_at(button.tag() as usize);
     }
 
-    /// Open the top-level menu at `first`, then keep switching whenever the hover watcher
-    /// (`check_switch`) cancels the current menu because the mouse moved to a peer title —
-    /// giving system-style menu-bar tracking. `NSMenu` dismisses on click-outside natively.
     /// Recolor the top-level title at `idx` for the open/closed state: white while its menu is open
-    /// (inverted over the solid selection pill, matching the dropdown/palette), else the adaptive
-    /// label color. `idx` indexes both the visible `buttons` and the `model` (they're aligned).
+    /// (inverted over the solid selection pill, matching the dropdown/palette), else the opaque
+    /// appearance color. `idx` indexes both the visible `buttons` and the `model` (they're aligned).
     fn set_title_highlighted(&self, idx: usize, on: bool) {
         let (button, title, is_first) = {
             let inner = self.ivars().inner.borrow();
@@ -1027,13 +1026,25 @@ impl Controller {
         };
         let (font, bold) = menu_bar_fonts(self.mtm());
         let f: &NSFont = if is_first { &bold } else { &font };
-        let color = if on {
-            NSColor::whiteColor()
-        } else {
-            NSColor::labelColor()
-        };
-        button.setAttributedTitle(&title_attr(&title, f, &color));
+        button.setAttributedTitle(&title_attr(&title, f, &bar_title_color(self.mtm(), on)));
     }
+
+    /// Re-apply the appearance-appropriate opaque title color to every visible top title. Needed
+    /// after a live theme change, since the baked opaque colors don't auto-adapt like a semantic
+    /// color would.
+    fn recolor_titles(&self) {
+        let (n, open) = {
+            let inner = self.ivars().inner.borrow();
+            (inner.buttons.len(), inner.open_top)
+        };
+        for i in 0..n {
+            self.set_title_highlighted(i, open == Some(i));
+        }
+    }
+
+    /// Open the top-level menu at `first`, then keep switching whenever the hover watcher
+    /// (`check_switch`) cancels the current menu because the mouse moved to a peer title —
+    /// giving system-style menu-bar tracking. `NSMenu` dismisses on click-outside natively.
 
     fn open_menu_at(&self, first: usize) {
         let mtm = self.mtm();
@@ -1414,16 +1425,16 @@ fn make_button(
     let btn =
         unsafe { NSButton::buttonWithTitle_target_action(&ns, Some(target), Some(action), mtm) };
     btn.setBordered(false);
-    // Explicit foreground (labelColor) so the acrylic vibrancy doesn't grey the text out; labelColor
-    // adapts to light/dark. The active title is re-colored white by `set_title_highlighted`.
-    btn.setAttributedTitle(&title_attr(title, font, &NSColor::labelColor()));
+    // Plain opaque foreground so the acrylic vibrancy doesn't blend it translucent (a semantic color
+    // like labelColor looks washed-out vs crisp menu text). `set_title_highlighted` swaps it white.
+    btn.setAttributedTitle(&title_attr(title, font, &bar_title_color(mtm, false)));
     btn.setEnabled(enabled);
     btn.setTag(tag);
     btn
 }
 
-/// An attributed string rendering `text` at `font` in `color`. Bar titles set an explicit foreground
-/// so the acrylic vibrancy doesn't grey them out (`labelColor` normally, white while selected).
+/// An attributed string rendering `text` at `font` in `color`. Bar titles set an explicit opaque
+/// foreground so the acrylic vibrancy doesn't blend them translucent (see `bar_title_color`).
 fn title_attr(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttributedString> {
     let color_obj: &AnyObject = color;
     let font_obj: &AnyObject = font;
@@ -1441,6 +1452,24 @@ fn title_attr(text: &str, font: &NSFont, color: &NSColor) -> Retained<NSAttribut
             Some(&attrs),
         )
     }
+}
+
+/// The bar's title color: a PLAIN opaque color (not a semantic/vibrant one like `labelColor`, which
+/// the acrylic vibrancy blends translucent — looking washed-out next to crisp system menu text).
+/// White while `selected` (over the selection pill) or in Dark mode; opaque black in Light mode.
+fn bar_title_color(mtm: MainThreadMarker, selected: bool) -> Retained<NSColor> {
+    if selected || is_dark_appearance(mtm) {
+        NSColor::colorWithWhite_alpha(1.0, 1.0) // opaque white
+    } else {
+        NSColor::colorWithWhite_alpha(0.0, 1.0) // opaque black
+    }
+}
+
+/// Whether the app's effective appearance is Dark. Honors the theme setting, which is applied via
+/// `NSApplication::setAppearance` (so this follows System/Dark/Light).
+fn is_dark_appearance(mtm: MainThreadMarker) -> bool {
+    let appearance = NSApplication::sharedApplication(mtm).effectiveAppearance();
+    &*appearance.name() == unsafe { NSAppearanceNameDarkAqua }
 }
 
 /// The standard system menu-bar height.
