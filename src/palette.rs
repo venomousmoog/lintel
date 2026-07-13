@@ -264,6 +264,7 @@ struct PaletteIvars {
     spinner: Retained<NSProgressIndicator>,
     center_x: Cell<f64>, // fixed Cocoa point the panel is centered on (x, y)
     center_y: Cell<f64>,
+    anchor_top: Cell<f64>, // locked Cocoa y of the panel's top edge while a query is active
     matches: RefCell<Vec<Command>>,
     rows: RefCell<Vec<Retained<NSButton>>>,
     selected: Cell<usize>,
@@ -360,6 +361,7 @@ impl PaletteController {
             spinner,
             center_x: Cell::new(center_x),
             center_y: Cell::new(center_y),
+            anchor_top: Cell::new(center_y), // set for real on the first (empty-query) layout
             matches: RefCell::new(Vec::new()),
             rows: RefCell::new(Vec::new()),
             selected: Cell::new(0),
@@ -427,13 +429,21 @@ impl PaletteController {
         self.restyle_selection();
     }
 
-    /// Resize the panel to `height` (kept centered on the parent window) and re-place the sub-views.
+    /// Resize the panel to `height` and re-place the sub-views. The panel's TOP edge is locked
+    /// relative to the parent window: while the query is empty (the full, unfiltered list — the
+    /// initial look) it stays centered and we record that top edge; once a query narrows the
+    /// results the top stays put, so the panel grows/shrinks downward instead of jumping around
+    /// the center as the match count changes.
     fn relayout(&self, height: f64) {
         let panel = &self.ivars().panel;
-        let origin = NSPoint::new(
-            self.ivars().center_x.get() - PANEL_W / 2.0,
-            self.ivars().center_y.get() - height / 2.0,
-        );
+        let top = if self.ivars().field.stringValue().to_string().is_empty() {
+            let centered_top = self.ivars().center_y.get() + height / 2.0;
+            self.ivars().anchor_top.set(centered_top);
+            centered_top
+        } else {
+            self.ivars().anchor_top.get()
+        };
+        let origin = NSPoint::new(self.ivars().center_x.get() - PANEL_W / 2.0, top - height);
         panel.setFrame_display(NSRect::new(origin, NSSize::new(PANEL_W, height)), true);
 
         let full = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PANEL_W, height));
