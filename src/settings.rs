@@ -53,18 +53,44 @@ fn parse_frame(s: &str) -> Option<NSRect> {
 }
 
 /// Apply the app appearance for `theme` (System = follow the OS). Affects all Lintel windows.
+/// `OppositeSystem` resolves to an explicit Light/Dark that inverts the current OS setting; the
+/// controller re-applies it when the system flips (an override posts no app-level appearance event).
 pub fn apply_theme(mtm: MainThreadMarker, theme: Theme) {
     let app = NSApplication::sharedApplication(mtm);
     let appearance = match theme {
         Theme::System => None,
         Theme::Dark => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameDarkAqua }),
         Theme::Light => NSAppearance::appearanceNamed(unsafe { NSAppearanceNameAqua }),
+        Theme::OppositeSystem => {
+            let sys_dark = system_is_dark();
+            tracing::debug!("apply theme OppositeSystem: system dark={sys_dark} -> Lintel {}", if sys_dark { "Light" } else { "Dark" });
+            let name = if sys_dark {
+                unsafe { NSAppearanceNameAqua } // system Dark -> Lintel Light
+            } else {
+                unsafe { NSAppearanceNameDarkAqua } // system Light -> Lintel Dark
+            };
+            NSAppearance::appearanceNamed(name)
+        }
     };
     app.setAppearance(appearance.as_deref());
 }
 
+/// Whether the OS is in Dark mode, independent of any app-level appearance override we've set.
+/// Reads the global `AppleInterfaceStyle` default (`"Dark"` in Dark mode, absent in Light).
+pub fn system_is_dark() -> bool {
+    let key = NSString::from_str("AppleInterfaceStyle");
+    NSUserDefaults::standardUserDefaults()
+        .stringForKey(&key)
+        .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
+}
+
 /// The theme choices in popup order (index into this array is the selection index).
-const THEME_ORDER: [Theme; 3] = [Theme::System, Theme::Dark, Theme::Light];
+const THEME_ORDER: [Theme; 4] = [
+    Theme::System,
+    Theme::Dark,
+    Theme::Light,
+    Theme::OppositeSystem,
+];
 
 fn theme_index(t: Theme) -> usize {
     THEME_ORDER.iter().position(|&x| x == t).unwrap_or(0)
@@ -77,6 +103,7 @@ fn theme_label(t: Theme) -> &'static str {
         Theme::System => "System",
         Theme::Dark => "Dark",
         Theme::Light => "Light",
+        Theme::OppositeSystem => "Opposite System",
     }
 }
 

@@ -36,12 +36,15 @@ fn default_true() -> bool {
     true
 }
 
-/// App appearance: follow the system, or force Dark / Light.
+/// App appearance: follow the system, force Dark / Light, or invert the system.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Theme {
     System,
     Dark,
     Light,
+    /// The inverse of the OS setting — Light while the system is Dark, Dark while it's Light —
+    /// tracked live as the system appearance changes.
+    OppositeSystem,
 }
 
 impl Default for Theme {
@@ -81,7 +84,7 @@ pub struct Config {
     /// Global hotkey that opens the command palette (menu type-ahead search).
     #[serde(default = "default_palette_hotkey")]
     pub palette_hotkey: HotkeyChord,
-    /// App appearance (System / Dark / Light).
+    /// App appearance (System / Dark / Light / Opposite System).
     #[serde(default)]
     pub theme: Theme,
 }
