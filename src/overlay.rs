@@ -237,6 +237,16 @@ fn same_element(a: &AXUIElement, b: &AXUIElement) -> bool {
     CFEqual(Some(&**a), Some(&**b))
 }
 
+/// Whether `app` currently has at least one standard (document/main) window — as opposed to only
+/// transient windows (popovers / sheets / panels) or none at all. Reads `AXWindows`, which stays
+/// readable while the app is backgrounded, so it reliably distinguishes "a transient sits over a
+/// real window" (keep the bar) from "the app's last standard window just closed" (drop the bar).
+fn app_has_standard_window(app: &AXUIElement) -> bool {
+    ax::attr_elements(app, names::AX_WINDOWS)
+        .iter()
+        .any(|w| ax::attr_string(w, names::AX_SUBROLE).as_deref() == Some(STANDARD_WINDOW_SUBROLE))
+}
+
 /// What a reconciliation step decided to do with the bar (executed after the RefCell borrow drops).
 enum Action {
     Show(f64, f64, Retained<NSPanel>),
@@ -270,6 +280,7 @@ struct Inner {
     config: Config,                         // live user settings (timings); edited via the settings pane
     tick_timer: Option<Retained<NSTimer>>,  // the reconciliation timer (recreated when poll rate changes)
     last_menu_check: Option<Instant>,       // last periodic menu re-read (picks up late-populating menus)
+    no_win_strikes: u32,                     // consecutive ticks the mirrored app had no standard window (debounces a stale-bar teardown against a transient AX read failure)
     hotkey: Option<crate::hotkey::HotkeyRegistration>, // global command-palette hotkey (RAII)
 }
 
@@ -371,6 +382,7 @@ impl Controller {
             config: config::load(),
             tick_timer: None,
             last_menu_check: None,
+            no_win_strikes: 0,
             hotkey: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
@@ -550,7 +562,41 @@ impl Controller {
         self.ivars().inner.borrow_mut().status_item = Some(item);
     }
 
+    /// Debounced "the app we're mirroring has lost its last standard window" test — used to tear
+    /// down a bar that would otherwise stay frozen (a persistent frontmost agent whose window
+    /// closed, or the mirrored app closing while Lintel's Settings/palette hold focus). Returns true
+    /// only after the app has shown no standard window for several consecutive ticks, so a single
+    /// transient `AXWindows` read failure can't wrongly hide a live app's bar (e.g. under a popover).
+    fn mirrored_lost_window(&self, app: &AXUIElement) -> bool {
+        const STRIKES_TO_HIDE: u32 = 3;
+        if app_has_standard_window(app) {
+            self.ivars().inner.borrow_mut().no_win_strikes = 0;
+            return false;
+        }
+        let strikes = {
+            let mut inner = self.ivars().inner.borrow_mut();
+            inner.no_win_strikes = inner.no_win_strikes.saturating_add(1);
+            inner.no_win_strikes
+        };
+        strikes >= STRIKES_TO_HIDE
+    }
+
+    /// Keep the `OppositeSystem` theme inverted as the OS Light/Dark setting changes. A live system
+    /// switch posts no app-level appearance event while we hold an explicit override, so the tick is
+    /// our signal; we re-apply only when the current app appearance no longer matches the inverse.
+    fn sync_opposite_theme(&self) {
+        if self.ivars().inner.borrow().config.theme != crate::config::Theme::OppositeSystem {
+            return;
+        }
+        let want_dark = !crate::settings::system_is_dark();
+        if is_dark_appearance(self.mtm()) != want_dark {
+            crate::settings::apply_theme(self.mtm(), crate::config::Theme::OppositeSystem);
+            self.recolor_titles(); // baked opaque title colors don't auto-adapt; refresh them
+        }
+    }
+
     fn on_tick(&self) {
+        self.sync_opposite_theme();
         if !ax::is_trusted() {
             self.hide_all();
             return;
@@ -560,6 +606,23 @@ impl Controller {
             return;
         };
         if pid == std::process::id() as i32 {
+            // Lintel itself is frontmost (its Settings window or the command palette). We never
+            // mirror ourselves — but the app we were mirroring may have closed its last window while
+            // we held focus, leaving the shown bar frozen here. `AXWindows` is readable for a
+            // backgrounded app, so this won't false-hide a live-but-inactive app: only tear the bar
+            // down when the mirrored app truly has no standard window left.
+            let (cur, shown) = {
+                let i = self.ivars().inner.borrow();
+                (i.current_pid, i.shown)
+            };
+            if shown && cur != 0 {
+                let app = ax::app_element(cur);
+                ax::set_timeout(&app, 0.3); // just a liveness probe; keep any main-thread stall short
+                if self.mirrored_lost_window(&app) {
+                    tracing::debug!("frontmost is self; mirrored app {cur} has no standard window -> hide");
+                    self.hide_all();
+                }
+            }
             return; // never mirror ourselves
         }
 
@@ -572,6 +635,7 @@ impl Controller {
         let app = ax::app_element(pid);
         ax::set_timeout(&app, 1.0);
         let Some(win) = ax::focused_window(&app) else {
+            tracing::debug!("no focused window for frontmost pid {pid} -> hide");
             self.hide_all();
             return;
         };
@@ -584,14 +648,24 @@ impl Controller {
         // Otherwise (a different app's transient, e.g. a TCC prompt owned by UserNotificationCenter,
         // or nothing showing) we hide. Checked before the refocus logic so a transient never drags
         // the bar off its parent window.
+        //
+        // Crucially, only keep the bar if the app still HAS a standard window behind the transient.
+        // When the app's last standard window closes, `focused_window` can return a leftover/dying
+        // window whose subrole reads as non-standard (often None), which would otherwise freeze a
+        // stale bar until focus leaves the app — and it never does for a persistent menu-bar agent
+        // (e.g. Cisco Secure Client stays frontmost with no window after you close its window).
         let subrole = ax::attr_string(&win, names::AX_SUBROLE);
         if subrole.as_deref() != Some(STANDARD_WINDOW_SUBROLE) {
-            let keep = {
+            let showing_this_app = {
                 let inner = self.ivars().inner.borrow();
                 inner.shown && inner.current_pid == pid
             };
+            // Keep the bar only while the app still has a real window behind the transient. The
+            // debounced check short-circuits (no AX read unless we'd otherwise keep) and tolerates a
+            // transient AXWindows read failure, so it never hides a live app's bar under a popover.
+            let keep = showing_this_app && !self.mirrored_lost_window(&app);
             tracing::debug!(
-                "transient focused window (subrole={subrole:?}) -> {}",
+                "transient focused window (subrole={subrole:?}, showing={showing_this_app}) -> {}",
                 if keep { "keep bar in place" } else { "hide" }
             );
             if !keep {
@@ -599,6 +673,8 @@ impl Controller {
             }
             return;
         }
+        // Focused window is a real standard window — clear any stale no-window strikes.
+        self.ivars().inner.borrow_mut().no_win_strikes = 0;
 
         // Focus moved to a different window of the SAME app (a genuine focus change, not a move of
         // the same window): kill + refocus onto it too. `begin_refocus` clears `current_window`, so

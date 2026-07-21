@@ -29,6 +29,7 @@ pub mod names {
     pub const AX_PRESS: &str = "AXPress";
     pub const AX_FOCUSED_WINDOW: &str = "AXFocusedWindow";
     pub const AX_MAIN_WINDOW: &str = "AXMainWindow";
+    pub const AX_WINDOWS: &str = "AXWindows"; // the app's full window list (readable while backgrounded)
     pub const AX_POSITION: &str = "AXPosition";
     pub const AX_SIZE: &str = "AXSize";
     pub const AX_FOCUSED_WINDOW_CHANGED: &str = "AXFocusedWindowChanged";
@@ -120,9 +121,9 @@ pub fn attr_element(el: &AXUIElement, attr: &str) -> Option<CFRetained<AXUIEleme
     Some(unsafe { CFRetained::from_raw(raw.cast::<AXUIElement>()) })
 }
 
-/// Read the `AXChildren` of an element as owned AXUIElements.
-pub fn children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
-    let Some(v) = copy_attr(el, names::AX_CHILDREN) else {
+/// Read an array-of-elements attribute (e.g. `AXChildren`, `AXWindows`) as owned AXUIElements.
+pub fn attr_elements(el: &AXUIElement, attr: &str) -> Vec<CFRetained<AXUIElement>> {
+    let Some(v) = copy_attr(el, attr) else {
         return Vec::new();
     };
     let Some(arr) = v.downcast_ref::<CFArray>() else {
@@ -138,6 +139,11 @@ pub fn children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
         }
     }
     out
+}
+
+/// Read the `AXChildren` of an element as owned AXUIElements.
+pub fn children(el: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
+    attr_elements(el, names::AX_CHILDREN)
 }
 
 /// Perform `AXPress` on a (leaf) element.
