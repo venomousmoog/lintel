@@ -15,16 +15,18 @@ use objc2::{
     define_class, msg_send, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly,
 };
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationOptions, NSBackingStoreType, NSButton, NSColor, NSControl,
+    NSApplication, NSApplicationActivationOptions, NSBackingStoreType, NSBitmapImageRep, NSButton,
+    NSColor, NSControl, NSDeviceRGBColorSpace,
     NSFocusRingType, NSFont, NSRunningApplication,
     NSFontAttributeName, NSForegroundColorAttributeName, NSLayoutAttribute, NSLineBreakMode,
     NSMutableParagraphStyle, NSPanel, NSParagraphStyleAttributeName, NSProgressIndicator, NSScreen,
     NSStackView, NSTextAlignment, NSTextField, NSTextView, NSUserInterfaceLayoutOrientation, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowStyleMask,
+    NSWindowOrderingMode, NSWindowStyleMask,
 };
 use objc2_application_services::{AXError, AXUIElement};
 use objc2_core_foundation::CFRetained;
+use objc2_quartz_core::kCAGravityResize;
 use objc2_foundation::{
     NSAttributedString, NSDictionary, NSMutableAttributedString, NSNotification, NSPoint, NSRange,
     NSRect, NSSize, NSString, NSTimer,
@@ -259,6 +261,7 @@ struct PaletteIvars {
     panel: Retained<NSPanel>,
     effect: Retained<NSVisualEffectView>,
     tint: Retained<NSView>,
+    scrim: RefCell<Option<Retained<NSPanel>>>, // dim over the parent window while open
     field: Retained<NSTextField>,
     results: Retained<NSStackView>,
     spinner: Retained<NSProgressIndicator>,
@@ -356,6 +359,7 @@ impl PaletteController {
             panel,
             effect,
             tint,
+            scrim: RefCell::new(None),
             field,
             results,
             spinner,
@@ -510,6 +514,9 @@ impl PaletteController {
     fn close(&self) {
         if let Some(t) = self.ivars().timer.borrow_mut().take() {
             t.invalidate();
+        }
+        if let Some(scrim) = self.ivars().scrim.borrow_mut().take() {
+            scrim.orderOut(None); // remove the parent-window dim
         }
         self.ivars().panel.orderOut(None);
         // We stole activation to take key focus; hand it back to the app that was frontmost when the
@@ -703,8 +710,11 @@ pub fn open(mtm: MainThreadMarker, pid: i32) {
         std::thread::spawn(move || build_index(pid, idx));
     }
 
-    // Center the palette on the focused window.
-    let (cx, cy) = target_center(mtm, pid);
+    // Center the palette on the focused window; keep its frame for the dim scrim.
+    let parent_frame = target_frame(mtm, pid);
+    let (cx, cy) = parent_frame
+        .map(|f| (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0))
+        .unwrap_or_else(|| target_center(mtm, pid));
 
     let controller = PaletteController::new(
         mtm,
@@ -744,12 +754,20 @@ pub fn open(mtm: MainThreadMarker, pid: i32) {
     panel.makeKeyAndOrderFront(None);
     panel.makeFirstResponder(Some(&field));
 
+    // Dim the parent window (a scrim just below the palette) to focus attention on the palette.
+    if let Some(frame) = parent_frame {
+        let scrim = make_scrim(mtm, frame);
+        unsafe { panel.addChildWindow_ordered(&scrim, NSWindowOrderingMode::Below) };
+        *controller.ivars().scrim.borrow_mut() = Some(scrim);
+    }
+
     PANEL.with(|p| *p.borrow_mut() = Some(panel));
     CONTROLLER.with(|c| *c.borrow_mut() = Some(controller));
 }
 
 /// Cocoa (center-x, center-y) of `pid`'s focused window; falls back to the main screen center.
-fn target_center(mtm: MainThreadMarker, pid: i32) -> (f64, f64) {
+/// The focused window's frame in Cocoa (screen) coordinates, or None if it can't be read.
+fn target_frame(mtm: MainThreadMarker, pid: i32) -> Option<NSRect> {
     let primary_h = NSScreen::screens(mtm)
         .iter()
         .next()
@@ -757,20 +775,116 @@ fn target_center(mtm: MainThreadMarker, pid: i32) -> (f64, f64) {
         .unwrap_or(1080.0);
     let app = ax::app_element(pid);
     ax::set_timeout(&app, 0.5);
-    if let Some(win) = ax::focused_window(&app) {
-        if let (Some(p), Some(s)) = (
-            ax::attr_point(&win, names::AX_POSITION),
-            ax::attr_size(&win, names::AX_SIZE),
-        ) {
-            // AX is top-left/y-down; flip the window's vertical center to Cocoa y-up.
-            return (p.x + s.width / 2.0, primary_h - (p.y + s.height / 2.0));
-        }
+    let win = ax::focused_window(&app)?;
+    let p = ax::attr_point(&win, names::AX_POSITION)?;
+    let s = ax::attr_size(&win, names::AX_SIZE)?;
+    // AX is top-left/y-down; flip to Cocoa bottom-left/y-up.
+    Some(NSRect::new(
+        NSPoint::new(p.x, primary_h - (p.y + s.height)),
+        NSSize::new(s.width, s.height),
+    ))
+}
+
+/// The Cocoa center point to place the palette on — the focused window's center, else the main
+/// screen's center.
+fn target_center(mtm: MainThreadMarker, pid: i32) -> (f64, f64) {
+    if let Some(f) = target_frame(mtm, pid) {
+        return (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0);
     }
     if let Some(screen) = NSScreen::mainScreen(mtm) {
         let f = screen.frame();
         return (f.origin.x + f.size.width / 2.0, f.origin.y + f.size.height / 2.0);
     }
+    let primary_h = NSScreen::screens(mtm)
+        .iter()
+        .next()
+        .map(|s| s.frame().size.height)
+        .unwrap_or(1080.0);
     (700.0, primary_h / 2.0)
+}
+
+/// A dim scrim window covering `frame` (the parent window), shown just under the palette to focus
+/// attention on it. Rounded so it matches the window's corners; click-through (purely visual).
+fn make_scrim(mtm: MainThreadMarker, frame: NSRect) -> Retained<NSPanel> {
+    let scrim = NSPanel::initWithContentRect_styleMask_backing_defer(
+        NSPanel::alloc(mtm),
+        frame,
+        NSWindowStyleMask::Borderless,
+        NSBackingStoreType::Buffered,
+        false,
+    );
+    unsafe { scrim.setReleasedWhenClosed(false) };
+    scrim.setOpaque(false);
+    scrim.setBackgroundColor(Some(&NSColor::clearColor()));
+    scrim.setIgnoresMouseEvents(true); // purely visual; clicks fall through (and dismiss the palette)
+    scrim.setHasShadow(false);
+    let dim = NSView::initWithFrame(
+        NSView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+    );
+    dim.setWantsLayer(true);
+    if let Some(layer) = dim.layer() {
+        // Feathered dim: full-strength black in the interior, fading to zero over SCRIM_FEATHER pt
+        // at every edge. A tiny tile 9-sliced (contentsCenter) to any window size — the center
+        // (full dim) stretches, the feathered border stays a fixed width. Because the dim fades to
+        // nothing at the edges, the parent window's corner radius no longer matters: any overhang
+        // past a rounded corner sits in the ~zero-alpha border, so there's nothing to match.
+        if let Some(cg) = feather_tile().CGImage() {
+            let t = SCRIM_TILE as f64;
+            let f = SCRIM_FEATHER as f64;
+            unsafe { let _: () = msg_send![&*layer, setContents: &*cg]; }
+            layer.setContentsGravity(unsafe { kCAGravityResize });
+            layer.setContentsCenter(NSRect::new(
+                NSPoint::new(f / t, f / t),
+                NSSize::new((t - 2.0 * f) / t, (t - 2.0 * f) / t),
+            ));
+        }
+    }
+    scrim.setContentView(Some(&dim));
+    scrim
+}
+
+const SCRIM_FEATHER: usize = 24; // px (= pt at 1x) the dim fades over at each window edge
+const SCRIM_TILE: usize = SCRIM_FEATHER * 2 + 4; // 9-slice tile: feather borders + a small center
+const SCRIM_DIM_ALPHA: f64 = 0.18; // interior dim strength
+
+/// Build the feather tile: black everywhere, alpha ramping 0 → SCRIM_DIM_ALPHA over SCRIM_FEATHER
+/// px from each edge (2-D near the corners), full in the center. Used 9-sliced as the scrim's dim.
+fn feather_tile() -> Retained<NSBitmapImageRep> {
+    let n = SCRIM_TILE;
+    let bpr = n * 4;
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            n as isize,
+            n as isize,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            bpr as isize,
+            32,
+        )
+    }
+    .expect("feather bitmap rep");
+    let f = SCRIM_FEATHER as f64;
+    unsafe {
+        let buf = std::slice::from_raw_parts_mut(rep.bitmapData(), bpr * n);
+        for y in 0..n {
+            for x in 0..n {
+                let d = x.min(y).min(n - 1 - x).min(n - 1 - y) as f64;
+                let a = SCRIM_DIM_ALPHA * (d / f).min(1.0);
+                let i = y * bpr + x * 4;
+                buf[i] = 0;
+                buf[i + 1] = 0;
+                buf[i + 2] = 0;
+                buf[i + 3] = (a * 255.0).round() as u8;
+            }
+        }
+    }
+    rep
 }
 
 #[cfg(test)]

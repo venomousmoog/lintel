@@ -36,7 +36,7 @@ features = [
     "NSColor", "NSEvent", "NSGraphics", "NSUserInterfaceLayout", "NSLayoutConstraint",
     "NSLayoutAnchor",
     "NSFont", "NSStatusBar", "NSStatusItem", "NSMenu", "NSMenuItem", "NSImage",
-    "NSAppearance", "NSPopUpButton",
+    "NSBitmapImageRep", "NSAppearance", "NSPopUpButton",
     "NSAttributedString", "NSAnimation", "NSAnimationContext", "NSWorkspace",
     "NSRunningApplication", "NSTabView", "NSTabViewItem", "NSSlider", "NSTextField",
     "NSText", "NSTextView", "NSProgressIndicator", "NSParagraphStyle", "NSCell",
