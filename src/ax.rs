@@ -151,6 +151,20 @@ pub fn press(el: &AXUIElement) -> AXError {
     unsafe { el.perform_action(&cfstr(names::AX_PRESS)) }
 }
 
+/// Set a `CGPoint`-valued attribute (e.g. `AXPosition`, global top-left). Returns false on failure —
+/// e.g. the target app doesn't allow moving the window (some windows are position-locked).
+pub fn set_point(el: &AXUIElement, attr: &str, mut p: CGPoint) -> bool {
+    let ptr = NonNull::new(&mut p as *mut CGPoint as *mut c_void).unwrap();
+    let Some(v) = (unsafe { AXValue::new(AXValueType::CGPoint, ptr) }) else {
+        return false;
+    };
+    // AXValue is a CFType; move the +1 across the cast so `set_attribute_value` can take a `&CFType`.
+    let cf: CFRetained<CFType> =
+        unsafe { CFRetained::from_raw(CFRetained::into_raw(v).cast::<CFType>()) };
+    let name = cfstr(attr);
+    unsafe { el.set_attribute_value(&name, &cf) == AXError::Success }
+}
+
 /// The focused (or main) window element of an app.
 pub fn focused_window(app: &AXUIElement) -> Option<CFRetained<AXUIElement>> {
     attr_element(app, names::AX_FOCUSED_WINDOW).or_else(|| attr_element(app, names::AX_MAIN_WINDOW))

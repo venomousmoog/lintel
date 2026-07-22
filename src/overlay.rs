@@ -8,7 +8,7 @@
 //! moves that post no AX events). Single menu level for now; presses the cached leaf element (no
 //! re-resolve-by-path yet — fine for static/native menus).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
 use core::ptr::NonNull;
 
@@ -20,10 +20,13 @@ use objc2::{
 };
 use objc2_app_kit::{
     NSAnimatablePropertyContainer, NSAnimationContext, NSAppearanceNameDarkAqua, NSApplication,
-    NSBackingStoreType, NSButton, NSColor,
-    NSEvent, NSEventModifierFlags, NSFont, NSFontAttributeName, NSForegroundColorAttributeName,
-    NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStackView, NSStatusBar,
-    NSStatusItem, NSUserInterfaceLayoutOrientation, NSVariableStatusItemLength, NSView,
+    NSBackingStoreType, NSButton, NSColor, NSCursor,
+    NSEvent, NSEventMask, NSEventModifierFlags, NSEventTrackingRunLoopMode, NSEventType, NSFont,
+    NSFontAttributeName, NSForegroundColorAttributeName,
+    NSImage, NSLayoutAttribute, NSMenu, NSMenuItem, NSPanel, NSRectFill, NSRunningApplication,
+    NSScreen, NSStackView, NSStatusBar,
+    NSStatusItem, NSTrackingArea, NSTrackingAreaOptions, NSUserInterfaceLayoutOrientation,
+    NSVariableStatusItemLength, NSView,
     NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
     NSWindowCollectionBehavior, NSWindowStyleMask, NSWorkspace,
 };
@@ -33,8 +36,8 @@ use objc2_core_foundation::{
     CGSize,
 };
 use objc2_foundation::{
-    NSAttributedString, NSDictionary, NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint, NSRect,
-    NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
+    NSAttributedString, NSDate, NSDictionary, NSEdgeInsets, NSObject, NSObjectProtocol, NSPoint,
+    NSRect, NSRunLoop, NSRunLoopCommonModes, NSSize, NSString, NSTimer,
 };
 use objc2_quartz_core::{kCAMediaTimingFunctionLinear, CAMediaTimingFunction};
 
@@ -62,6 +65,8 @@ const WINDOW_GAP: f64 = 2.0; // gap between the window's top edge and the bar
 // Nudge the popped menu down so its visual top clears the bar's bottom edge. NSMenu renders its
 // top chrome a few points above the requested location, which otherwise overlaps the bar.
 const MENU_DROP: f64 = 10.0;
+const HANDLE_SIZE: f64 = 16.0; // app-icon / grip drag handle at the bar's left edge (points)
+const DRAG_ECHO_MS: u64 = 250; // after a handle-drag, ignore the AX move notifications it triggers
 
 // ---- menu model (elements cached for the current app) -------------------------------------
 
@@ -247,6 +252,152 @@ fn app_has_standard_window(app: &AXUIElement) -> bool {
         .any(|w| ax::attr_string(w, names::AX_SUBROLE).as_deref() == Some(STANDARD_WINDOW_SUBROLE))
 }
 
+// ---- drag handle -------------------------------------------------------------------------
+
+/// Ivars for the left-edge drag handle. `controller` is a borrowed `*const Controller` (the
+/// Controller owns the panel that owns this view, so it always outlives the handle).
+struct HandleIvars {
+    controller: *const Controller,
+    app_icon: RefCell<Option<Retained<NSImage>>>,
+    hovering: Cell<bool>,
+    tracking: RefCell<Option<Retained<NSTrackingArea>>>,
+}
+
+define_class!(
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "LintelDragHandle"]
+    #[ivars = HandleIvars]
+    struct HandleView;
+
+    impl HandleView {
+        #[unsafe(method(intrinsicContentSize))]
+        fn intrinsic_content_size(&self) -> NSSize {
+            NSSize::new(HANDLE_SIZE, HANDLE_SIZE)
+        }
+
+        #[unsafe(method(drawRect:))]
+        fn draw_rect(&self, _dirty: NSRect) {
+            self.draw();
+        }
+
+        // The bar mirrors another app, so Lintel is essentially never active — the press on the
+        // handle is always a "first mouse". Accept it so the very first click starts the drag rather
+        // than being swallowed as a window-activating click.
+        #[unsafe(method(acceptsFirstMouse:))]
+        fn accepts_first_mouse(&self, _event: Option<&NSEvent>) -> bool {
+            true
+        }
+
+        #[unsafe(method(mouseDown:))]
+        fn mouse_down(&self, event: &NSEvent) {
+            let c = self.ivars().controller;
+            if !c.is_null() {
+                unsafe { &*c }.begin_handle_drag(event);
+            }
+        }
+
+        #[unsafe(method(mouseEntered:))]
+        fn mouse_entered(&self, _event: &NSEvent) {
+            self.ivars().hovering.set(true);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(mouseExited:))]
+        fn mouse_exited(&self, _event: &NSEvent) {
+            self.ivars().hovering.set(false);
+            self.setNeedsDisplay(true);
+        }
+
+        #[unsafe(method(cursorUpdate:))]
+        fn cursor_update(&self, _event: &NSEvent) {
+            NSCursor::openHandCursor().set(); // "grabbable" hint while hovering
+        }
+
+        #[unsafe(method(updateTrackingAreas))]
+        fn update_tracking_areas(&self) {
+            self.reset_tracking();
+            let _: () = unsafe { msg_send![super(self), updateTrackingAreas] };
+        }
+    }
+);
+
+impl HandleView {
+    fn new_handle(mtm: MainThreadMarker, controller: *const Controller) -> Retained<HandleView> {
+        let this = HandleView::alloc(mtm).set_ivars(HandleIvars {
+            controller,
+            app_icon: RefCell::new(None),
+            hovering: Cell::new(false),
+            tracking: RefCell::new(None),
+        });
+        let this: Retained<HandleView> = unsafe { msg_send![super(this), init] };
+        this.reset_tracking();
+        this
+    }
+
+    fn set_icon(&self, icon: Option<Retained<NSImage>>) {
+        *self.ivars().app_icon.borrow_mut() = icon;
+        self.setNeedsDisplay(true);
+    }
+
+    /// (Re)install the mouse-enter/exit + cursor tracking area over the whole view.
+    fn reset_tracking(&self) {
+        // Drop the borrow before calling AppKit (removeTrackingArea) — avoids holding a RefMut on
+        // `tracking` across a call that could, in principle, re-enter updateTrackingAreas.
+        let old = self.ivars().tracking.borrow_mut().take();
+        if let Some(old) = old {
+            self.removeTrackingArea(&old);
+        }
+        let opts = NSTrackingAreaOptions::MouseEnteredAndExited
+            | NSTrackingAreaOptions::CursorUpdate
+            | NSTrackingAreaOptions::ActiveAlways
+            | NSTrackingAreaOptions::InVisibleRect;
+        let owner: &AnyObject = self;
+        let area = unsafe {
+            NSTrackingArea::initWithRect_options_owner_userInfo(
+                NSTrackingArea::alloc(),
+                self.bounds(),
+                opts,
+                Some(owner),
+                None,
+            )
+        };
+        self.addTrackingArea(&area);
+        *self.ivars().tracking.borrow_mut() = Some(area);
+    }
+
+    /// Draw the app icon at rest; the grip texture while hovering (or if there's no icon), so the
+    /// handle always shows *something* grabbable.
+    fn draw(&self) {
+        let b = self.bounds();
+        let icon = self.ivars().app_icon.borrow();
+        if self.ivars().hovering.get() || icon.is_none() {
+            let color = bar_title_color(self.mtm(), false);
+            color.setFill();
+            // Two columns × three rows of small dots, centered — a "grip" texture.
+            let (dot, gx, gy) = (2.0_f64, 3.0_f64, 3.0_f64);
+            let gw = 2.0 * dot + gx;
+            let gh = 3.0 * dot + 2.0 * gy;
+            let ox = b.origin.x + (b.size.width - gw) / 2.0;
+            let oy = b.origin.y + (b.size.height - gh) / 2.0;
+            for r in 0..3 {
+                for c in 0..2 {
+                    let x = ox + c as f64 * (dot + gx);
+                    let y = oy + r as f64 * (dot + gy);
+                    NSRectFill(NSRect::new(NSPoint::new(x, y), NSSize::new(dot, dot)));
+                }
+            }
+        } else if let Some(img) = icon.as_ref() {
+            img.drawInRect(b);
+        }
+    }
+}
+
+/// The mirrored app's icon, for the drag handle.
+fn app_icon(pid: i32) -> Option<Retained<NSImage>> {
+    NSRunningApplication::runningApplicationWithProcessIdentifier(pid)?.icon()
+}
+
 /// What a reconciliation step decided to do with the bar (executed after the RefCell borrow drops).
 enum Action {
     Show(f64, f64, Retained<NSPanel>),
@@ -281,6 +432,8 @@ struct Inner {
     tick_timer: Option<Retained<NSTimer>>,  // the reconciliation timer (recreated when poll rate changes)
     last_menu_check: Option<Instant>,       // last periodic menu re-read (picks up late-populating menus)
     no_win_strikes: u32,                     // consecutive ticks the mirrored app had no standard window (debounces a stale-bar teardown against a transient AX read failure)
+    dragging: bool,                          // a handle-drag is moving the window -> don't hide/chase the bar
+    ignore_moves_until: Option<Instant>,     // suppress the AX move notifications a handle-drag leaves behind
     hotkey: Option<crate::hotkey::HotkeyRegistration>, // global command-palette hotkey (RAII)
 }
 
@@ -383,6 +536,8 @@ impl Controller {
             tick_timer: None,
             last_menu_check: None,
             no_win_strikes: 0,
+            dragging: false,
+            ignore_moves_until: None,
             hotkey: None,
         };
         let this = Self::alloc(mtm).set_ivars(Ivars {
@@ -764,6 +919,14 @@ impl Controller {
     /// (so it never visibly chases) and mark it moving; the timer re-pins it once things settle.
     fn begin_move(&self) {
         let now = Instant::now();
+        // A handle-drag moves the window itself (and posts AX move events as it goes, plus a trailing
+        // echo just after). Don't treat those as a user window-move: the drag keeps the bar pinned.
+        {
+            let inner = self.ivars().inner.borrow();
+            if inner.dragging || inner.ignore_moves_until.is_some_and(|t| now < t) {
+                return;
+            }
+        }
         let bar = {
             let mut inner = self.ivars().inner.borrow_mut();
             inner.moving = true;
@@ -777,6 +940,80 @@ impl Controller {
             tracing::debug!("begin_move -> hide");
             self.hide_fast(bar); // pop out fast during a move; re-pin (fade) once settled
         }
+    }
+
+    /// The user pressed the drag handle: run a local mouse-tracking loop that moves the mirrored
+    /// window 1:1 with the cursor (via AX), keeping the bar pinned under the handle throughout. The
+    /// loop pumps only mouse-drag/up in the event-tracking mode, so the reconcile tick and the AX
+    /// move observer stay quiet until we're done (and `dragging` guards `begin_move` regardless).
+    fn begin_handle_drag(&self, _event: &NSEvent) {
+        let win = match &self.ivars().inner.borrow().current_window {
+            Some(w) => w.clone(),
+            None => return, // nothing focused to move
+        };
+        let (Some(start_pos), Some(size)) = (
+            ax::attr_point(&win, names::AX_POSITION),
+            ax::attr_size(&win, names::AX_SIZE),
+        ) else {
+            return;
+        };
+        // Mark the gesture first so the AX move events our own set_point triggers don't hide the bar.
+        self.ivars().inner.borrow_mut().dragging = true;
+        ax::set_timeout(&win, 0.2); // bound each per-move IPC so a slow app can't stall the drag
+        // Bail cleanly if the window is position-locked (some apps refuse AXPosition): setting it to
+        // its current position is a no-op that still reports settability — no "grabbing" cursor for a
+        // gesture that can't move anything.
+        if !ax::set_point(&win, names::AX_POSITION, start_pos) {
+            self.ivars().inner.borrow_mut().dragging = false;
+            return;
+        }
+        let start_mouse = NSEvent::mouseLocation(); // screen coords, y-up, global
+        let bar = self.ivars().inner.borrow().bar.clone();
+        NSCursor::closedHandCursor().push();
+
+        let app = NSApplication::sharedApplication(self.mtm());
+        let mode = unsafe { NSEventTrackingRunLoopMode };
+        let mask = NSEventMask::LeftMouseDragged | NSEventMask::LeftMouseUp;
+        let until = NSDate::distantFuture();
+        loop {
+            let ev = app.nextEventMatchingMask_untilDate_inMode_dequeue(mask, Some(&until), mode, true);
+            let Some(ev) = ev else { break };
+            if ev.r#type() == NSEventType::LeftMouseUp {
+                break;
+            }
+            // Coalesce the burst: `ax::set_point` is a synchronous IPC to the target app, slower than
+            // drag events arrive. Drain the queued drags (non-blocking, `None` = poll) and act only on
+            // the LATEST cursor position, so the window jumps straight to the pointer instead of
+            // grinding through a growing backlog of stale moves (which is what made it trail).
+            while app
+                .nextEventMatchingMask_untilDate_inMode_dequeue(
+                    NSEventMask::LeftMouseDragged,
+                    None,
+                    mode,
+                    true,
+                )
+                .is_some()
+            {}
+            let now = NSEvent::mouseLocation();
+            // Screen y is bottom-up, AX y is top-down, so moving the mouse up lowers the AX y.
+            let target = CGPoint::new(
+                start_pos.x + (now.x - start_mouse.x),
+                start_pos.y - (now.y - start_mouse.y),
+            );
+            ax::set_point(&win, names::AX_POSITION, target);
+            // Pin the bar to where the window ACTUALLY landed — the app/OS may clamp it (e.g. near the
+            // menu bar or screen edges) or snap the origin to whole pixels. Recording the real position
+            // as last_frame keeps the resumed tick from seeing a phantom "move" and blinking the bar,
+            // and keeps the bar attached to a clamped window mid-drag.
+            let actual = ax::attr_point(&win, names::AX_POSITION).unwrap_or(target);
+            let (x, y_top) = self.place(actual);
+            bar.setFrameOrigin(NSPoint::new(x, y_top + WINDOW_GAP));
+            self.ivars().inner.borrow_mut().last_frame = Some((actual, size));
+        }
+        NSCursor::pop_class();
+        let mut inner = self.ivars().inner.borrow_mut();
+        inner.dragging = false;
+        inner.ignore_moves_until = Some(Instant::now() + Duration::from_millis(DRAG_ECHO_MS));
     }
 
     /// The 60 Hz reconciliation: show on a fresh focus, hide while the window is moving, and
@@ -1008,6 +1245,11 @@ impl Controller {
         let (font, bold) = menu_bar_fonts(mtm);
         let target: &AnyObject = self;
 
+        // Left-edge drag handle (mirrored app's icon; grip on hover) — grab it to move the window.
+        let pid = self.ivars().inner.borrow().current_pid;
+        let handle = HandleView::new_handle(mtm, self as *const Controller);
+        handle.set_icon(app_icon(pid));
+
         let titles: Vec<(String, bool)> = {
             let inner = self.ivars().inner.borrow();
             inner
@@ -1030,8 +1272,10 @@ impl Controller {
             btns.push(btn);
         }
 
-        // Natural width of all buttons; if it exceeds the window, fit a prefix + overflow button.
+        // Natural width: the handle + all buttons. If it exceeds the window, fit a prefix + overflow.
+        let handle_extent = HANDLE_SIZE + ITEM_SPACING; // handle width + the gap before the first title
         let natural = 2.0 * BAR_EDGE
+            + handle_extent
             + widths.iter().sum::<f64>()
             + ITEM_SPACING * (n.saturating_sub(1)) as f64;
         let mut visible = n;
@@ -1039,7 +1283,7 @@ impl Controller {
         let mut overflow_btn = None;
         if n > 0 && natural > avail {
             let ov = make_button(mtm, OVERFLOW_LABEL, &font, true, target, sel!(openOverflow:), -1);
-            let mut used = 2.0 * BAR_EDGE + ov.fittingSize().width + ITEM_SPACING;
+            let mut used = 2.0 * BAR_EDGE + handle_extent + ov.fittingSize().width + ITEM_SPACING;
             let mut k = 0usize;
             for w in &widths {
                 let add = w + if k > 0 { ITEM_SPACING } else { 0.0 };
@@ -1059,6 +1303,7 @@ impl Controller {
             overflow_from.is_some()
         );
 
+        stack.addArrangedSubview(&handle); // handle first, at the bar's left edge
         let mut buttons = Vec::with_capacity(visible);
         for btn in btns.into_iter().take(visible) {
             stack.addArrangedSubview(&btn);
